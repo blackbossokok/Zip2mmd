@@ -1919,13 +1919,39 @@ def api_browse():
 
 # ==================== 前端页面 ====================
 
+def _ui_asset(name):
+    """页面用到的图标：打包后在 _MEIPASS，源码运行时在 app.py 旁边"""
+    for d in (RES_DIR, BASE_DIR):
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+@app.route("/favicon.ico")
+def favicon():
+    p = _ui_asset("app.ico")
+    if not p:
+        return Response(status=404)
+    return send_file(p, mimetype="image/x-icon", max_age=86400)
+
+
+@app.route("/icon.png")
+def icon_png():
+    p = _ui_asset("app_icon.png")
+    if not p:
+        return Response(status=404)
+    return send_file(p, mimetype="image/png", max_age=86400)
+
+
 PAGE_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Zip2mmd</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233b6ef5'/%3E%3Cpath d='M12 9h8v4h-2v2h2v2h-2v2h2v6h-8v-6h2v-2h-2v-2h2v-2h-2z' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="icon" type="image/png" href="/icon.png">
+<link rel="shortcut icon" type="image/x-icon" href="/favicon.ico">
 <style>
 :root{
   --bg:#fafafb; --panel:#fff; --line:#ededf1; --line2:#e2e2e8;
@@ -1947,6 +1973,7 @@ button,input,select{font-family:inherit}
   background:#fff;border-right:1px solid var(--line);padding:14px 12px 40px}
 .brand{display:flex;align-items:center;gap:8px;padding:2px 6px 14px;cursor:default;user-select:none}
 .brand .dot{width:22px;height:22px;border-radius:7px;background:linear-gradient(135deg,#3b6ef5,#7c5cf0);flex:none}
+.brand .logo{width:24px;height:24px;border-radius:7px;flex:none;display:block}
 .brand h1{font-size:14px;font-weight:650;letter-spacing:.2px;white-space:nowrap}
 .srow{display:flex;gap:6px;align-items:center;margin-bottom:8px}
 .srow .grow{flex:1;min-width:0}
@@ -2023,7 +2050,7 @@ button,input,select{font-family:inherit}
 .rows .card .fn{-webkit-line-clamp:1;flex:1}
 .rows .card .fs{margin:0;white-space:nowrap;flex:none}
 /* ---------- 压缩包封面 ---------- */
-.card .box .cover{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;
+.card .box .cover{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block;
   background:#f3f4f8;z-index:1}
 .card .box .cover.hide{display:none}
 .card .box .ext{z-index:0}
@@ -2032,7 +2059,7 @@ button,input,select{font-family:inherit}
 .arcard:hover{border-color:#c7cdff;box-shadow:0 4px 14px rgba(59,110,245,.12);transform:translateY(-1px)}
 .arcard.on{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
 .arcard .abox{height:118px;background:#f3f4f8;position:relative;display:flex;align-items:center;justify-content:center;overflow:hidden}
-.arcard .abox img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1}
+.arcard .abox img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;z-index:1;background:#f3f4f8}
 .arcard .ainfo{padding:8px 9px;min-height:52px}
 .arcard .an2{font-size:11.6px;line-height:1.32;word-break:break-all;display:-webkit-box;
   -webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;color:#2e2e36}
@@ -2234,7 +2261,7 @@ body.view-collapsed #viewTab{right:0}
 <body>
 
 <aside id="sidebar">
-  <div class="brand" id="brandBtn" title="点一下刷新（外部改动了文件夹后用它重新扫描）"><div class="dot"></div><h1>Zip2mmd</h1></div>
+  <div class="brand" id="brandBtn" title="点一下刷新（外部改动了文件夹后用它重新扫描）"><img class="logo" src="/icon.png" alt=""><h1>Zip2mmd</h1></div>
   <div class="srow"><input class="sinput grow" id="q" placeholder="搜索压缩包…" autocomplete="off">
     <button class="fbtn" id="filterBtn" title="筛选">筛选</button></div>
   <div class="fpanel hide" id="filterPanel">
@@ -3454,7 +3481,10 @@ function standUp(obj){
   return false;
 }
 
+let _loadSeq = 0;       // 连点模型时用序号丢弃过期的加载
+
 async function loadModel(path){
+  const seq = ++_loadSeq;     // 本次加载的序号，后面任何一步发现变了就放弃
   const f = S.files.find(x=>x.path===path);
   if(!f) return;
   if(f.size === '0 B'){          // 空文件：直接提示，别让它走到加载器报脚本错误
@@ -3472,6 +3502,8 @@ async function loadModel(path){
     const pdir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
     await post('/api/prefetch', {path:S.cur, dir:pdir, password:S.pwd});
   }catch(e){}
+  // prefetch 是异步的，等它回来期间用户可能又点了别的模型 —— 那这次就不要了
+  if(seq !== _loadSeq) return;
 
   curModelPath = S.cur;
   const ext = f.ext;
@@ -3492,10 +3524,25 @@ async function loadModel(path){
 
   const mgr = makeManager(dir);
   const onErr = err=>{
+    if(seq !== _loadSeq) return;
     console.error(err);
     setHint('加载失败', esc(String((err && (err.message || err.type)) || '文件可能损坏')));
   };
   const onLoad = obj=>{
+    // 已经换成别的模型了：把这次加载出来的对象丢掉，不要加进场景
+    if(seq !== _loadSeq){
+      try{
+        obj.traverse(o=>{
+          if(o.geometry && o.geometry.dispose) o.geometry.dispose();
+          if(o.material){
+            (Array.isArray(o.material)?o.material:[o.material]).forEach(m=>{
+              if(m.dispose) m.dispose();
+            });
+          }
+        });
+      }catch(e){}
+      return;
+    }
     OBJ = obj;
     // 统一材质：颜色贴图按 sRGB 解释（含自发光贴图），纠正导出常见的 metalness=1 发灰，处理 unlit 模型
     let missingTex = 0;
