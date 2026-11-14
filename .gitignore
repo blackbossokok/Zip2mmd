@@ -1,0 +1,23 @@
+# 运行产物
+dist/
+build/
+_build/
+*.spec
+__pycache__/
+*.pyc
+*.pyo
+
+# 本地配置（含个人目录和密码，绝对不能提交）
+config.json
+config*.json
+
+# 运行时缓存
+_cache/
+_scratch/
+
+# 编辑器 / 工具
+.vscode/
+.idea/
+.workbuddy-ai/
+Thumbs.db
+desktop.ini
