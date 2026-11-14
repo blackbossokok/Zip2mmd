@@ -1463,6 +1463,125 @@ def api_model():
     return Response(data, mimetype="application/octet-stream")
 
 
+# ---------- 批量预解压：模型加载时把同目录资源一次性解出来 ----------
+_pf_lock = threading.Lock()
+
+
+def _extract_key(archive):
+    """同一个压缩包（路径+修改时间+大小）对应同一个缓存目录"""
+    try:
+        st = os.stat(archive)
+    except OSError:
+        return ""
+    raw = "%s|%d|%d" % (archive, int(st.st_mtime), st.st_size)
+    return hashlib.md5(raw.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _prefetch_lookup(archive, inner):
+    """预解压缓存里有没有这个文件；有就直接返回字节"""
+    key = _extract_key(archive)
+    if not key or not inner:
+        return None
+    safe = os.path.normpath(inner).replace("\\", "/")
+    if safe.startswith("../") or safe.startswith("/"):
+        return None
+    dst = os.path.join(EXTRACT_DIR, key, safe)
+    try:
+        if os.path.isfile(dst):
+            with open(dst, "rb") as f:
+                return f.read()
+    except OSError:
+        pass
+    return None
+
+
+def _pf_complete(archive):
+    """整包是否已经预解压过"""
+    key = _extract_key(archive)
+    if not key:
+        return False
+    marker = os.path.join(EXTRACT_DIR, key, ".pf_" + hashlib.md5(b"").hexdigest()[:10])
+    return os.path.isfile(marker)
+
+
+@app.route("/api/prefetch", methods=["POST"])
+def api_prefetch():
+    """把某个包内目录下的资源一次性解到缓存，之后贴图请求直接读本地文件。
+    体积/数量超限就跳过（避免为了一个模型白解几百 MB）。"""
+    body = request.get_json(silent=True) or {}
+    arc = body.get("path") or ""
+    req_dir = (body.get("dir") or "").replace("\\", "/").strip().strip("/")
+    if not arc or not os.path.isfile(arc) or not SEVEN_ZIP:
+        return jsonify({"ok": False})
+    pw = body.get("password") or load_config().get("password", DEFAULT_PASSWORD)
+    key = _extract_key(arc)
+    if not key:
+        return jsonify({"ok": False})
+    dest = os.path.join(EXTRACT_DIR, key)
+
+    try:
+        entries = list_archive(arc, pw if pw else None)
+    except Exception:
+        return jsonify({"ok": False})
+
+    # 优先整个包都解出来（PMX 的贴图常在同级目录或 tex 子目录，只解模型目录会漏）；
+    # 整个包太大时退化成只解模型所在目录。
+    total_all = sum(int(e.get("raw_size") or 0) for e in entries)
+    if total_all <= 400 * 1024 * 1024 and len(entries) <= 800:
+        inner_dir = ""
+    else:
+        inner_dir = req_dir
+        pre = inner_dir.lower() + "/" if inner_dir else ""
+        sub = [e for e in entries if (not pre or e["path"].lower().startswith(pre))]
+        total = sum(int(e.get("raw_size") or 0) for e in sub)
+        if total > 300 * 1024 * 1024 or len(sub) > 500:
+            return jsonify({"ok": True, "skipped": True, "bytes": total, "count": len(sub)})
+
+    marker = os.path.join(dest, ".pf_" + hashlib.md5(inner_dir.encode("utf-8")).hexdigest()[:10])
+    if os.path.isfile(marker):
+        return jsonify({"ok": True, "cached": True})
+
+    with _pf_lock:
+        if os.path.isfile(marker):
+            return jsonify({"ok": True, "cached": True})
+        ensure_dirs()
+        part = dest + ".tmp"
+        shutil.rmtree(part, ignore_errors=True)
+        os.makedirs(part, exist_ok=True)
+        args = [SEVEN_ZIP, "x", arc, "-o" + part, "-y", "-sccUTF-8",
+                ("-p" + pw) if pw else "-p-"]
+        if inner_dir:
+            args.append(inner_dir + "/*")
+        try:
+            r = _run(args, timeout=180)
+            if r.returncode not in (0, 1):
+                shutil.rmtree(part, ignore_errors=True)
+                return jsonify({"ok": False, "error": "解压失败"})
+        except Exception as e:
+            shutil.rmtree(part, ignore_errors=True)
+            return jsonify({"ok": False, "error": str(e)})
+
+        os.makedirs(dest, exist_ok=True)
+        for root, _dirs, files in os.walk(part):
+            rel = os.path.relpath(root, part)
+            target = dest if rel == "." else os.path.join(dest, rel)
+            try:
+                os.makedirs(target, exist_ok=True)
+            except OSError:
+                continue
+            for fn in files:
+                try:
+                    os.replace(os.path.join(root, fn), os.path.join(target, fn))
+                except OSError:
+                    pass
+        shutil.rmtree(part, ignore_errors=True)
+        try:
+            open(marker, "w").close()
+        except OSError:
+            pass
+    return jsonify({"ok": True, "files": len(entries), "scope": inner_dir or "(整包)"})
+
+
 @app.route("/api/asset")
 def api_asset():
     """模型依赖资源（贴图 / .bin / .mtl），相对模型所在目录解析。
@@ -1488,12 +1607,34 @@ def api_asset():
 
     ext = os.path.splitext(inner)[1].lower()
     data = None
-    for pwd in ([pw] if pw else []) + [None]:
-        try:
-            data = read_bytes(p, inner, pwd)
-            break
-        except Exception:
-            continue
+    # 已经整包预解压过：只读本地文件，一次 7z 都不调
+    if p and _pf_complete(p):
+        data = _prefetch_lookup(p, inner)
+        if data is None:
+            want = os.path.basename(rel).lower()
+            try:
+                for f in list_cached(p, pw):
+                    if f["name"].lower() == want:
+                        data = _prefetch_lookup(p, f["path"])
+                        if data is not None:
+                            inner = f["path"]
+                            ext = os.path.splitext(inner)[1].lower()
+                        break
+            except Exception:
+                pass
+        if data is None:
+            if ext in IMAGE_EXTS or ext in TEX_EXTRA:
+                return Response(WHITE_PNG if ext in TEX_EXTRA else BLANK_PNG, mimetype="image/png")
+            abort(404)
+    else:
+        # 命中批量预解压缓存就直接读文件，省掉一次 7z 调用
+        data = _prefetch_lookup(p, inner) if p else None
+        for pwd in ([] if data is not None else ([pw] if pw else []) + [None]):
+            try:
+                data = read_bytes(p, inner, pwd)
+                break
+            except Exception:
+                continue
 
     # 路径对不上时按文件名兜底（FBX/GLTF 里的贴图路径常与实际目录不一致）
     if data is None:
@@ -1501,7 +1642,9 @@ def api_asset():
         try:
             for f in list_cached(p, pw):
                 if f["name"].lower() == want:
-                    data = read_bytes(p, f["path"], pw)
+                    data = _prefetch_lookup(p, f["path"])
+                    if data is None:
+                        data = read_bytes(p, f["path"], pw)
                     inner = f["path"]
                     ext = os.path.splitext(inner)[1].lower()
                     break
@@ -3323,6 +3466,12 @@ async function loadModel(path){
     return;
   }
   if(!initGL()) return;
+
+  // 先把模型同目录的资源一次性解出来：后面几十张贴图就不用逐个调 7z 了
+  try{
+    const pdir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+    await post('/api/prefetch', {path:S.cur, dir:pdir, password:S.pwd});
+  }catch(e){}
 
   curModelPath = S.cur;
   const ext = f.ext;
