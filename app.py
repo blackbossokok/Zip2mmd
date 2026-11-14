@@ -19,6 +19,7 @@ import zipfile
 import tempfile
 import subprocess
 import threading
+import concurrent.futures
 from flask import Flask, send_file, jsonify, request, abort, Response
 
 app = Flask(__name__)
@@ -1152,30 +1153,88 @@ def api_cover():
 
 
 _cover_flag = {}
+_cover_lock = threading.Lock()
+_COVER_INDEX = os.path.join(CACHE_DIR, "cover_index.json")
+
+
+def _cover_index_load():
+    """把「有没有预览图」的结果存到磁盘：上万条时开机第一次也不用重扫"""
+    try:
+        with open(_COVER_INDEX, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            return d
+    except Exception:
+        pass
+    return {}
+
+
+def _cover_index_save(d):
+    try:
+        tmp = _COVER_INDEX + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        os.replace(tmp, _COVER_INDEX)
+    except Exception:
+        pass
 
 
 @app.route("/api/covers")
 def api_covers():
-    """批量统计「有没有预览图」，给筛选和批量模式用（按 路径+mtime+size 缓存）"""
+    """批量统计「有没有预览图」，给筛选和批量模式用。
+    按 路径+mtime+size 缓存，落盘到 _cache/cover_index.json，并且多线程并发探测。"""
     cfg = load_config()
     names = cover_names()
     pw = cfg.get("password", DEFAULT_PASSWORD)
-    out = {}
-    for a in scan_archives(cfg["watch_dirs"]):
+    archives = scan_archives(cfg["watch_dirs"])
+
+    disk = _cover_index_load()
+    out, todo, stamps = {}, [], {}
+
+    with _cover_lock:
+        mem = dict(_cover_flag)
+
+    for a in archives:
         p = a["path"].replace("/", "\\")
         try:
             st = os.stat(p)
-            key = (p, st.st_mtime, st.st_size)
+            stamp = [int(st.st_mtime), int(st.st_size)]
         except OSError:
             out[a["path"]] = False
             continue
-        if key not in _cover_flag:
+        stamps[p] = stamp
+        if p in disk and isinstance(disk[p], list) and disk[p][:2] == stamp:
+            has = bool(disk[p][2])
+            _cover_flag[(p, st.st_mtime, st.st_size)] = has
+            out[a["path"]] = has
+            continue
+        key = (p, st.st_mtime, st.st_size)
+        if key in mem:
+            out[a["path"]] = mem[key]
+            continue
+        todo.append(p)
+
+    if todo:
+        def _probe(p):
             try:
-                _cover_flag[key] = bool(find_cover(p, pw, names))
+                return p, bool(find_cover(p, pw, names))
             except Exception:
-                _cover_flag[key] = False
-        out[a["path"]] = _cover_flag[key]
-    return jsonify({"map": out})
+                return p, False
+
+        # 7z 是外部进程，开几个线程并发探测；137 个约 0.6 秒，上万条也能接受
+        workers = min(16, max(4, (os.cpu_count() or 4) * 2))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            for p, has in ex.map(_probe, todo):
+                disk[p] = stamps.get(p, [0, 0]) + [has]
+                _cover_flag[(p, stamps.get(p, [0, 0])[0], stamps.get(p, [0, 0])[1])] = has
+                out[p.replace("\\", "/")] = has
+
+        # 清掉已经不存在的条目，避免索引越滚越大
+        alive = set(stamps)
+        disk = {k: v for k, v in disk.items() if k in alive}
+        _cover_index_save(disk)
+
+    return jsonify({"map": out, "scanned": len(todo), "total": len(archives)})
 
 
 @app.route("/api/cover/delete", methods=["POST"])
@@ -2022,12 +2081,19 @@ button,input,select{font-family:inherit}
 .card.dragging{opacity:.4}
 .card.sel{outline:2px solid var(--accent);outline-offset:-2px;background:#f3f7ff}
 .srow{position:relative}
-.fpanel{position:absolute;left:calc(100% + 6px);top:0;width:198px;background:#fff;border:1px solid var(--line);
-  border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.14);padding:10px;z-index:90;
-  display:flex;flex-direction:column;gap:9px}
+/* 筛选面板：向右弹出的浮层。
+   用 position:fixed 才不会侧边栏的 overflow-x:hidden 裁掉（以前 absolute 往右弹看不见），
+   具体位置由 JS 按按钮的位置算，右边放不下就翻到左边。 */
+.fpanel{position:fixed;z-index:200;width:236px;background:#fff;border:1px solid var(--line);
+  border-radius:10px;box-shadow:0 12px 32px rgba(0,0,0,.16);padding:11px;
+  display:flex;flex-direction:column;gap:10px}
 .fpanel.hide{display:none}
-.fpanel .flabel{font-size:11px;color:var(--text3);margin-bottom:4px}
-.fpanel .fgroup{display:flex;gap:5px;flex-wrap:wrap}
+.fpanel .fgroup{display:flex;flex-direction:column;gap:5px}
+.fpanel .flabel{font-size:11px;color:var(--text3);line-height:1}
+.fpanel .frow{display:flex;gap:6px;flex-wrap:nowrap}
+/* 三颗筛选按钮统一高度，避免一行里参差 */
+.fpanel .frow .fbtn{flex:1 1 0;height:26px;padding:0 6px;display:inline-flex;align-items:center;
+  justify-content:center;font-size:12px;line-height:1;box-sizing:border-box}
 .batchbar{display:flex;align-items:center;gap:6px;padding:6px 10px;margin:8px 0;
   background:#eef3ff;border:1px solid #d9e2ff;border-radius:9px;min-height:34px;box-sizing:border-box}
 .batchbar.hide{display:none}
@@ -2265,15 +2331,21 @@ body.view-collapsed #viewTab{right:0}
   <div class="srow"><input class="sinput grow" id="q" placeholder="搜索压缩包…" autocomplete="off">
     <button class="fbtn" id="filterBtn" title="筛选">筛选</button></div>
   <div class="fpanel hide" id="filterPanel">
-    <div class="fgroup"><div class="flabel">加密</div>
-      <button class="fbtn on" data-fenc="all">全部</button>
-      <button class="fbtn" data-fenc="enc">已加密</button>
-      <button class="fbtn" data-fenc="plain">未加密</button>
+    <div class="fgroup">
+      <div class="flabel">加密</div>
+      <div class="frow">
+        <button class="fbtn on" data-fenc="all">全部</button>
+        <button class="fbtn" data-fenc="enc">已加密</button>
+        <button class="fbtn" data-fenc="plain">未加密</button>
+      </div>
     </div>
-    <div class="fgroup"><div class="flabel">预览图</div>
-      <button class="fbtn on" data-fcov="all">全部</button>
-      <button class="fbtn" data-fcov="has">有</button>
-      <button class="fbtn" data-fcov="none">无</button>
+    <div class="fgroup">
+      <div class="flabel">预览图</div>
+      <div class="frow">
+        <button class="fbtn on" data-fcov="all">全部</button>
+        <button class="fbtn" data-fcov="has">有</button>
+        <button class="fbtn" data-fcov="none">无</button>
+      </div>
     </div>
   </div>
   <div id="nav"></div>
@@ -2454,10 +2526,9 @@ function renderNav(){
   const q = $('#q').value.trim().toLowerCase();
   const m = S.meta;
   let h = '';
+  // 顶部的「全部」：固定入口，显示所有监控目录里的压缩包总数
   h += `<div class="entry ${S.sel && S.sel.type==='all' ? 'on':''}" data-nav="all">
-          <span class="t">全部压缩包</span><span class="n">${m.total}</span></div>`;
-  h += `<div class="entry ${S.sel && S.sel.type==='enc' ? 'on':''}" data-nav="enc">
-          <span class="t">已加密</span><span class="n">${m.encKnown < m.total ? m.encTotal + '…' : m.encTotal}</span></div>`;
+          <span class="t">全部</span><span class="n">${m.total}</span></div>`;
   h += `<div class="slabel">目录分组</div>`;
 
   for(const root of m.roots){
@@ -5096,7 +5167,22 @@ async function loadCovers(){
   return S.coverMap;
 }
 
-$('#filterBtn').onclick = ev=>{ ev.stopPropagation(); $('#filterPanel').classList.toggle('hide'); };
+$('#filterBtn').onclick = ev=>{
+  ev.stopPropagation();
+  const p = $('#filterPanel');
+  const btn = ev.currentTarget;
+  if(!p.classList.contains('hide')){ p.classList.add('hide'); return; }
+  p.classList.remove('hide');
+  // 浮层贴着按钮往右展开；右边放不下就翻到按钮左边，上下再夹进窗口
+  const r = btn.getBoundingClientRect();
+  const pr = p.getBoundingClientRect();
+  let left = r.right + 8;
+  if(left + pr.width > innerWidth - 8) left = Math.max(8, r.left - pr.width - 8);
+  let top = r.top;
+  if(top + pr.height > innerHeight - 8) top = Math.max(8, innerHeight - pr.height - 8);
+  p.style.left = left + 'px';
+  p.style.top = top + 'px';
+};
 $('#filterPanel').onclick = ev=>ev.stopPropagation();
 document.addEventListener('click', ()=>{ const p=$('#filterPanel'); if(p) p.classList.add('hide'); });
 $$('#filterPanel [data-fenc]').forEach(b=>b.onclick=()=>{
