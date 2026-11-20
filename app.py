@@ -10,19 +10,89 @@ import io
 import re
 import json
 import sys
+import socket
 import time
 import hashlib
 import struct
 import shlex
+import secrets
 import shutil
 import zipfile
 import tempfile
 import subprocess
 import threading
 import concurrent.futures
-from flask import Flask, send_file, jsonify, request, abort, Response
+from flask import Flask, send_file, send_from_directory, jsonify, request, abort, Response
+from urllib.parse import urlsplit
 
 app = Flask(__name__)
+
+# 本地接口令牌：写操作（POST）必须带上页面里嵌入的 token，
+# 防止本机其它程序随便调 /api/fs/move、/api/cover/delete 这类破坏性接口。
+# 只读的 GET（贴图/封面/下载）不校验，否则 <img src> 这类请求带不上 token。
+API_TOKEN = secrets.token_hex(9)
+APP_VERSION = "1.0.3"
+# 实际监听端口在 main 里确定后写入。用于生成「每实例唯一」的窗口标题和浏览器 profile，
+# 这样多开时每个进程只盯自己的窗口，关一个不会连累其它实例。
+APP_PORT = 5678
+
+
+@app.before_request
+def _require_token():
+    if not request.path.startswith("/api/"):
+        return None
+    # 只读 GET（贴图/封面/下载）没法带 token，但要挡住借接口读库外任意文件：
+    # 凡是带 path 参数的 GET，路径必须落在监控目录或本程序缓存目录内。
+    # 空 path 放行——它本来就定位不到文件，且 /api/asset 缺资源时要返回占位图。
+    if request.method in ("GET", "HEAD"):
+        rp = request.args.get("path", "")
+        if rp and not is_under_roots(rp, allow_cache=True):
+            return jsonify({"error": "forbidden path"}), 403
+        return None
+    # 本地工具：只接受同源页面的写请求，挡住其它网站诱导浏览器打 localhost
+    origin = request.headers.get("Origin")
+    if origin:
+        try:
+            if urlsplit(origin).netloc.lower() != request.host.lower():
+                return jsonify({"error": "forbidden origin"}), 403
+        except Exception:
+            return jsonify({"error": "forbidden origin"}), 403
+    site = request.headers.get("Sec-Fetch-Site")
+    if site and site not in ("same-origin", "none"):
+        return jsonify({"error": "forbidden origin"}), 403
+    # token 只走请求头，避免出现在 URL / 历史 / 日志里
+    if request.headers.get("X-ZT") == API_TOKEN:
+        return None
+    return jsonify({"error": "unauthorized"}), 401
+
+
+_JSON_WRITE_LOCK = threading.Lock()
+
+
+def _atomic_json(path, obj, indent=None, separators=None):
+    """所有本地 JSON 索引统一原子写：临时文件 + fsync + os.replace。
+    多开时最坏只是后写覆盖先写，不会把索引写成半截 JSON。"""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            if indent is None and separators is None:
+                json.dump(obj, f, ensure_ascii=False)
+            elif separators is not None:
+                json.dump(obj, f, ensure_ascii=False, separators=separators)
+            else:
+                json.dump(obj, f, ensure_ascii=False, indent=indent)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
 
 # ==================== 配置 ====================
 def _reg_path(subkey, value="Path"):
@@ -92,6 +162,7 @@ TRASH_DIR = os.path.join(CACHE_DIR, "trash")
 EXTRACT_DIR = os.path.join(CACHE_DIR, "x")
 COVER_DIR = os.path.join(CACHE_DIR, "covers")
 ENC_CACHE_FILE = os.path.join(CACHE_DIR, "encryption.json")
+SFX_CACHE_FILE = os.path.join(CACHE_DIR, "sfx.json")
 VENDOR_DIR = os.path.join(RES_DIR, "vendor")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
@@ -110,6 +181,10 @@ TEX_EXTRA = {".spa", ".sph", ".toon"}
 PMX_EXTS = {".pmx", ".pmd"}
 GLTF_EXTS = {".glb", ".gltf"}
 MODEL3D_EXTS = {".pmx", ".pmd", ".glb", ".gltf", ".fbx", ".obj"}
+MOTION_EXTS = {".vmd", ".vpd"}
+AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac", ".opus"}
+# 散落的资源文件（不在压缩包里）：都作为可预览/可管理的卡片收录，且都不参与加密探测
+LOOSE_EXTS = MODEL3D_EXTS | IMAGE_EXTS | TEX_EXTRA | MOTION_EXTS | AUDIO_EXTS
 
 FILE_ICONS = {}  # 界面改用纯文字扩展名标签，不再用图标
 
@@ -136,6 +211,16 @@ _list_lock = threading.Lock()
 _enc_cache = {}
 _enc_lock = threading.Lock()
 _prewarming = False
+# 最近一次扫描的 archives 轻量快照（path + encrypted），供 /api/encryption 轮询复用，
+# 避免每 1.2s 全量重扫。每次 build_meta 都会刷新它，保证拿到的是最新列表。
+_enc_poll_paths = []
+_enc_poll_lock = threading.Lock()
+# 最近一次 build_meta 的 archives 快照，供 /api/covers 复用，避免重复全库扫描
+_meta_archives = []
+_meta_lock = threading.Lock()
+# path -> (key, mtime, size)：增量补丁复用已算好的加密 key，避免对全库重复 md5
+_poll_by_path = {}
+_poll_lock = threading.Lock()
 
 
 # ==================== 加密探测 ====================
@@ -154,18 +239,22 @@ def save_enc_cache():
     try:
         with _enc_lock:
             snapshot = dict(_enc_cache)
-        with open(ENC_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, ensure_ascii=False)
+        with _JSON_WRITE_LOCK:
+            _atomic_json(ENC_CACHE_FILE, snapshot)
     except Exception:
         pass
 
 
-def _enc_key(path):
-    try:
-        st = os.stat(path)
-        return hashlib.md5(f"{path}|{st.st_mtime}|{st.st_size}".encode("utf-8", "replace")).hexdigest()
-    except OSError:
-        return hashlib.md5(path.encode("utf-8", "replace")).hexdigest()
+def _enc_key(path, mtime=None, size=None):
+    # 传入 mtime/size 时直接复用，避免对每个文件重复 stat（近万文件时这是首屏主要开销）。
+    # hash 输入仍是 path|mtime|size，与旧版完全一致，已有加密缓存不会失效。
+    if mtime is None or size is None:
+        try:
+            st = os.stat(path)
+            mtime, size = st.st_mtime, st.st_size
+        except OSError:
+            return hashlib.md5(path.encode("utf-8", "replace")).hexdigest()
+    return hashlib.md5(f"{path}|{mtime}|{size}".encode("utf-8", "replace")).hexdigest()
 
 
 def _zip_encrypted(path):
@@ -189,8 +278,12 @@ def _zip_encrypted(path):
         return None
 
 
-def probe_encrypted(path, ext):
-    key = _enc_key(path)
+def probe_encrypted(path, ext, key=None):
+    # 散资源文件不是压缩包：7z 打不开会被误判成「需要密码」，直接标记为未加密
+    if ext in LOOSE_EXTS:
+        return False
+    if key is None:
+        key = _enc_key(path)
     with _enc_lock:
         if key in _enc_cache:
             return _enc_cache[key]
@@ -230,13 +323,21 @@ def prewarm_encryption(watch_dirs):
         return
     _prewarming = True
     try:
+        # 复用最近一次 build_meta 的快照，避免这里再全库扫描一次
+        with _enc_poll_lock:
+            paths = list(_enc_poll_paths)
+        if not paths:
+            build_meta(watch_dirs)
+            with _enc_poll_lock:
+                paths = list(_enc_poll_paths)
         changed = False
-        for a in scan_archives(watch_dirs):
-            key = _enc_key(a["path"])
+        for item in paths:
+            path, key = item[0], item[1]
             with _enc_lock:
                 if key in _enc_cache:
                     continue
-            if probe_encrypted(a["path"], a["ext"]) is not None:
+            ext = os.path.splitext(path)[1].lower()
+            if probe_encrypted(path, ext, key) is not None:
                 changed = True
         if changed:
             save_enc_cache()
@@ -302,8 +403,8 @@ def normalize_cover_names(raw):
 def save_config(cfg):
     try:
         with _cfg_lock:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            with _JSON_WRITE_LOCK:
+                _atomic_json(CONFIG_FILE, cfg, indent=2)
     except Exception:
         # exe 放在只读目录时写不了配置，不影响本次运行
         pass
@@ -393,10 +494,35 @@ def _should_wipe(cfg=None):
     return bool(cfg.get("clear_cache_on_exit", True))
 
 
+def _other_instances_alive():
+    """还有别的实例在跑吗？多开时每个实例占一个端口（默认 5678 起，往后找 10 个）。
+    只要别的端口有人监听，退出时就别清共享 _cache——里面可能正有别的实例在读解压文件。
+    最后一个退出的实例才真正清缓存。"""
+    mine = APP_PORT
+    lo = max(1, min(5678, mine - 10))
+    hi = min(65535, max(mine + 10, 5678 + 20))
+    for p in range(lo, hi + 1):
+        if p == mine:
+            continue
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.05)
+        try:
+            if s.connect_ex(("127.0.0.1", p)) == 0:
+                return True
+        except Exception:
+            pass
+        finally:
+            s.close()
+    return False
+
+
 def _wipe_now():
     try:
         cfg = load_config()
         if not _should_wipe(cfg):
+            return
+        if _other_instances_alive():
+            print("  其它实例仍在运行，跳过缓存清理（最后一个退出时再清）")
             return
         freed = wipe_runtime_cache(include_thumbs=bool(cfg.get("clear_thumbs_too", False)))
         print(f"  已清空缓存，释放 {format_size(freed)}")
@@ -444,29 +570,65 @@ def _run(cmd, timeout=180, cwd=None):
                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
-def is_under_roots(path):
-    """路径是否位于某个监控目录内（文件操作安全边界）"""
-    real = os.path.abspath(path)
-    for root in load_config()["watch_dirs"]:
+def is_under_roots(path, allow_cache=False):
+    """路径是否位于允许操作的目录内。
+    用 realpath 防 junction/symlink 越界；allow_cache 供回收站/缓存文件查看使用。"""
+    try:
+        real = os.path.realpath(os.path.abspath(path))
+    except Exception:
+        return False
+    roots = list((load_config().get("watch_dirs") or []))
+    if allow_cache:
+        roots += [CACHE_DIR, THUMB_DIR, PMX_DIR, TMP_DIR, TRASH_DIR, EXTRACT_DIR, COVER_DIR]
+    for root in roots:
         try:
-            if os.path.commonpath([os.path.abspath(root), real]) == os.path.abspath(root):
+            base = os.path.realpath(os.path.abspath(root))
+            if os.path.commonpath([base, real]) == base:
                 return True
-        except ValueError:
+        except Exception:
             continue
     return False
 
 
 # ==================== 压缩包扫描 ====================
 
+def load_sfx_cache():
+    """读取持久化的 SFX 探测结果，避免每次启动都对每个 exe 起 7z 子进程"""
+    global _sfx_cache
+    if os.path.isfile(SFX_CACHE_FILE):
+        try:
+            with open(SFX_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                _sfx_cache = data
+        except Exception:
+            pass
+
+
+def save_sfx_cache():
+    try:
+        with _sfx_lock:
+            snapshot = dict(_sfx_cache)
+        with _JSON_WRITE_LOCK:
+            _atomic_json(SFX_CACHE_FILE, snapshot)
+    except Exception:
+        pass
+
+
+_sfx_dirty = False
+
+
 def is_sfx_archive(path):
+    global _sfx_dirty
     try:
         st = os.stat(path)
     except OSError:
         return False
-    key = (path, st.st_mtime, st.st_size)
+    # JSON 的 key 只能是字符串；用 路径|mtime|size 保证文件变了会重新探测
+    key = "%s|%d|%d" % (path, int(st.st_mtime), st.st_size)
     with _sfx_lock:
         if key in _sfx_cache:
-            return _sfx_cache[key]
+            return bool(_sfx_cache[key])
     ok = False
     try:
         r = _run([SEVEN_ZIP, "l", "-slt", "-ba", "-p-", path], timeout=30)
@@ -476,7 +638,51 @@ def is_sfx_archive(path):
         ok = False
     with _sfx_lock:
         _sfx_cache[key] = ok
+        _sfx_dirty = True
     return ok
+
+
+def _archive_entry(e, cur, root):
+    """把 scandir 的一个条目转成 archives 记录；不需要收录的资源返回 None。
+    全量扫描和增量补丁共用，保证两处字段完全一致。"""
+    f = e.name
+    ext = os.path.splitext(f)[1].lower()
+    full = e.path
+    if ext in ARCHIVE_EXTS:
+        kind = ext
+    elif ext in SFX_EXTS:
+        if not is_sfx_archive(full):
+            return None
+        kind = ".sfx"
+    elif ext in LOOSE_EXTS:
+        # 散落的资源文件（模型/图片/音频/动作，不在压缩包里）：作为可预览/管理的卡片收录
+        kind = ext
+    else:
+        return None
+    try:
+        st = e.stat(follow_symlinks=False)
+        size, mtime = st.st_size, st.st_mtime
+    except OSError:
+        size, mtime = 0, 0
+    rel = os.path.relpath(cur, root)
+    rel = "" if rel == "." else rel.replace("\\", "/")
+    top = rel.split("/")[0] if rel else ""
+    return {
+        "name": f,
+        "path": full.replace("\\", "/"),
+        "dir": cur.replace("\\", "/"),
+        "size": format_size(size),
+        "raw_size": size,
+        "mtime": mtime,
+        "ext": kind,
+        "badge": "SFX" if kind == ".sfx" else ext.lstrip(".").upper(),
+        "icon": "",
+        "root": root,
+        "rel": rel,
+        "dir_rel": rel,
+        "group": top,
+        "is_loose": ext in LOOSE_EXTS,   # 散资源文件（非压缩包），前端据此直接打开而非进第二层
+    }
 
 
 def scan_archives(watch_dirs):
@@ -484,42 +690,41 @@ def scan_archives(watch_dirs):
     for root in watch_dirs:
         if not os.path.isdir(root):
             continue
-        for cur, dirs, files in os.walk(root):
-            dirs[:] = [d for d in dirs if not d.startswith("_cache")]
-            for f in files:
-                ext = os.path.splitext(f)[1].lower()
-                full = os.path.join(cur, f)
-                if ext in ARCHIVE_EXTS:
-                    kind = ext
-                elif ext in SFX_EXTS:
-                    if not is_sfx_archive(full):
-                        continue
-                    kind = ".sfx"
-                else:
-                    continue
+        # 用 scandir 一次拿到 size/mtime（entry.stat 内部复用系统已读取的目录项信息），
+        # 避免 os.walk 后对每个文件再 getsize + getmtime 各 stat 一次。
+        stack = [root]
+        while stack:
+            cur = stack.pop()
+            try:
+                with os.scandir(cur) as it:
+                    entries = list(it)
+            except OSError:
+                continue
+            for e in entries:
                 try:
-                    size = os.path.getsize(full)
+                    if e.is_dir(follow_symlinks=False):
+                        if e.name.startswith("_cache"):
+                            continue
+                        stack.append(e.path)
+                        continue
+                    if not e.is_file(follow_symlinks=False):
+                        continue
                 except OSError:
-                    size = 0
-                rel = os.path.relpath(cur, root)
-                rel = "" if rel == "." else rel.replace("\\", "/")
-                top = rel.split("/")[0] if rel else ""
-                out.append({
-                    "name": f,
-                    "path": full.replace("\\", "/"),
-                    "dir": cur.replace("\\", "/"),
-                    "size": format_size(size),
-                    "raw_size": size,
-                    "ext": kind,
-                    "badge": "SFX" if kind == ".sfx" else ext.lstrip(".").upper(),
-                    "icon": "",
-                    "root": root,
-                    "rel": rel,
-                    "dir_rel": rel,
-                    "group": top,
-                })
+                    continue
+                a = _archive_entry(e, cur, root)
+                if a is not None:
+                    out.append(a)
     out.sort(key=lambda x: (x["root"], x["rel"], x["name"]))
+    save_sfx_cache_if_dirty()
     return out
+
+
+def save_sfx_cache_if_dirty():
+    """扫描结束后一次性落盘 SFX 缓存，避免每个 exe 探测都写文件"""
+    global _sfx_dirty
+    if _sfx_dirty:
+        _sfx_dirty = False
+        save_sfx_cache()
 
 
 def tree_list(node, prefix=""):
@@ -533,12 +738,8 @@ def tree_list(node, prefix=""):
     return out
 
 
-def build_meta(watch_dirs):
-    arch = scan_archives(watch_dirs)
-    with _enc_lock:
-        enc_snapshot = dict(_enc_cache)
-    for a in arch:
-        a["encrypted"] = enc_snapshot.get(_enc_key(a["path"]))
+def meta_summary(arch, watch_dirs):
+    """从 archives 列表算出前端要的 roots/tree/totals。全量与增量共用。"""
     roots = []
     for root in watch_dirs:
         items = [a for a in arch if a["root"] == root]
@@ -567,6 +768,133 @@ def build_meta(watch_dirs):
         "password": load_config().get("password", DEFAULT_PASSWORD),
         "archives": arch,
     }
+
+
+def _fill_encryption(arch, refresh_poll=True):
+    """给 archives 填充 encrypted 字段；refresh_poll 时同步刷新加密轮询快照。"""
+    global _poll_by_path
+    with _enc_lock:
+        enc_snapshot = dict(_enc_cache)
+    poll = []
+    by_path = {}
+    for a in arch:
+        # 散模型文件不是压缩包，固定未加密（否则 7z 探测打不开会误报加密）
+        if a.get("is_loose"):
+            a["encrypted"] = False
+            continue
+        key = _enc_key(a["path"], a.get("mtime"), a.get("raw_size"))
+        a["encrypted"] = enc_snapshot.get(key)
+        poll.append((a["path"], key, a.get("mtime"), a.get("raw_size")))
+        by_path[a["path"].replace("\\", "/").rstrip("/").lower()] = (key, a.get("mtime"), a.get("raw_size"))
+    if refresh_poll:
+        with _enc_poll_lock:
+            globals()["_enc_poll_paths"] = poll
+        with _poll_lock:
+            _poll_by_path = by_path
+    return poll
+
+
+def _scan_one_path(path, watch_dirs):
+    """只扫描单个文件/目录，返回 archives 记录。目录会递归，跳过 _cache。"""
+    out = []
+    norm = os.path.abspath(path).replace("\\", "/")
+    # 找到它属于哪个 watch root（最长匹配优先，处理嵌套监控目录）
+    root = None
+    for r in sorted(watch_dirs, key=len, reverse=True):
+        rn = os.path.abspath(r).replace("\\", "/").rstrip("/")
+        if norm == rn or norm.startswith(rn + "/"):
+            root = r
+            break
+    if root is None:
+        return out
+    stack = [os.path.normpath(path)]
+    while stack:
+        cur = stack.pop()
+        if os.path.isdir(cur):
+            for name in os.listdir(cur):
+                if name.startswith("_cache"):
+                    continue
+                stack.append(os.path.join(cur, name))
+            continue
+        try:
+            with os.scandir(os.path.dirname(cur)) as it:
+                for entry in it:
+                    if os.path.normpath(entry.path) == os.path.normpath(cur):
+                        a = _archive_entry(entry, os.path.dirname(cur), root)
+                        if a is not None:
+                            out.append(a)
+                        break
+        except OSError:
+            pass
+    return out
+
+
+def patch_meta(removed=(), added=(), watch_dirs=None):
+    """单文件操作后的增量 meta：从内存快照里去掉旧路径、补上新路径，再重算汇总。
+    不再全库 scandir，耗时约 0.01s（原来 0.33s）。任一环节异常则回退全量扫描。"""
+    cfg = load_config()
+    wd = watch_dirs or cfg["watch_dirs"]
+    try:
+        with _meta_lock:
+            base = list(_meta_archives)
+        if not base:                       # 冷启动还没快照，只能全量
+            return build_meta(wd)
+        # 统一成正斜杠、大小写不敏感比较。扫描出来的 path 已是绝对正斜杠，无需 abspath。
+        def _norm(p):
+            return str(p).replace("\\", "/").rstrip("/").lower()
+        rm = {_norm(p) for p in removed if p}
+        keep = []
+        for a in base:
+            ap = _norm(a["path"])
+            if ap in rm or any(ap.startswith(r + "/") for r in rm):
+                continue
+            keep.append(a)
+        seen = {_norm(a["path"]) for a in keep}
+        if added:
+            for p in added:
+                if not p:
+                    continue
+                for a in _scan_one_path(p, wd):
+                    ap = _norm(a["path"])
+                    if ap not in seen:
+                        keep.append(a)
+                        seen.add(ap)
+        keep.sort(key=lambda x: (x["root"], x["rel"], x["name"]))
+        # 加密状态增量刷新：老条目复用已算好的 key，只对新条目做 md5
+        with _enc_lock:
+            enc_snapshot = dict(_enc_cache)
+        with _poll_lock:
+            old_poll = dict(_poll_by_path)
+        poll, new_by_path = [], {}
+        for a in keep:
+            ap = _norm(a["path"])
+            if a.get("is_loose"):
+                a["encrypted"] = False
+                continue
+            hit = old_poll.get(ap)
+            if hit is None:
+                key = _enc_key(a["path"], a.get("mtime"), a.get("raw_size"))
+                hit = (key, a.get("mtime"), a.get("raw_size"))
+            a["encrypted"] = enc_snapshot.get(hit[0])
+            poll.append((a["path"], hit[0], hit[1], hit[2]))
+            new_by_path[ap] = hit
+        with _poll_lock:
+            globals()["_poll_by_path"] = new_by_path
+        with _enc_poll_lock:
+            globals()["_enc_poll_paths"] = poll
+        with _meta_lock:
+            globals()["_meta_archives"] = keep
+        return meta_summary(keep, wd)
+    except Exception:
+        return build_meta(wd)
+
+
+def build_meta(watch_dirs):
+    arch = scan_archives(watch_dirs)
+    _fill_encryption(arch)
+    with _meta_lock:
+        globals()["_meta_archives"] = arch
+    return meta_summary(arch, watch_dirs)
 
 
 # ==================== 7z 读取层 ====================
@@ -642,6 +970,25 @@ def _parse_slt(out):
     return entries
 
 
+def _fix_sjis_name(s):
+    """修复「日文 Shift-JIS 文件名被按 GBK 解码」的乱码（如 偆偦偮偒乮 → うそつき）。
+    只改显示名，读取路径仍用原始乱码串（7z 解压时要用它匹配文件）。
+    判定很严格，避免误伤正常中文名：原名无假名 + 能 gbk 编码 + cp932 解码成功
+    + 结果含日文假名，才认为是乱码。"""
+    try:
+        if any('\u3040' <= c <= '\u30ff' for c in s):
+            return s                      # 原名就有假名：已是正常日文，不动
+        raw = s.encode('gbk')
+        fixed = raw.decode('cp932')
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return s
+    if fixed == s:
+        return s
+    if any('\u3040' <= c <= '\u30ff' for c in fixed):
+        return fixed
+    return s
+
+
 def _to_files(entries):
     out = []
     for e in entries:
@@ -650,7 +997,7 @@ def _to_files(entries):
         p = e["path"].replace("\\", "/")
         ext = os.path.splitext(p)[1].lower()
         out.append({
-            "name": p.rsplit("/", 1)[-1],
+            "name": _fix_sjis_name(p.rsplit("/", 1)[-1]),
             "path": p,
             "size": format_size(e["size"]),
             "raw_size": e["size"],
@@ -715,7 +1062,19 @@ def _xkey(filepath, inner_path, password):
 def read_bytes(filepath, inner_path, password=None):
     """读压缩包内单个文件。
     解压结果按 (包路径+修改时间+包内路径+密码) 哈希持久化到 _cache/x，
-    命中缓存就不再调 7z —— 贴图/模型重复读取快很多，也不会产生临时垃圾。"""
+    命中缓存就不再调 7z —— 贴图/模型重复读取快很多，也不会产生临时垃圾。
+    若 filepath 本身就是散文件（模型/贴图），直接读本地文件，inner 作为同目录相对路径。"""
+    base_ext = os.path.splitext(filepath)[1].lower()
+    if base_ext in LOOSE_EXTS or base_ext in {".vtf", ".vmt"}:
+        # 散文件：inner 是相对它的目录路径；为空则读自身
+        rel = (inner_path or "").replace("\\", "/").strip()
+        target = filepath if not rel else os.path.join(os.path.dirname(filepath), rel)
+        target = os.path.normpath(target)
+        base_dir = os.path.normpath(os.path.dirname(filepath))
+        # 防目录穿越：必须在散文件所在目录内
+        if os.path.isfile(target) and (target == base_dir or target.startswith(base_dir + os.sep)):
+            with open(target, "rb") as f:
+                return f.read()
     key = _xkey(filepath, inner_path, password)
     base = os.path.join(EXTRACT_DIR, key[:2], key)
     direct = os.path.join(base, inner_path.replace("/", os.sep))
@@ -843,6 +1202,57 @@ def _cover_key(filepath, password, names):
     return (filepath, mt, sz, tuple(names), password or "")
 
 
+def zip_name_fast(filepath):
+    """ZIP 只列文件名时用标准库，避免为每张包开一个 7z 子进程。
+    失败返回 None，调用方照旧走 7z 路径。"""
+    try:
+        with zipfile.ZipFile(filepath) as z:
+            return [{"path": i.filename.replace("\\", "/")}
+                    for i in z.infolist() if not i.is_dir()]
+    except Exception:
+        return None
+
+
+def _pick_cover(paths, names):
+    """从包内路径列表里挑封面：命名优先级 + 目录层级，找不到返回空串。"""
+    if not paths:
+        return ""
+    lows = [n.lower() for n in names]
+    best = None
+    for p in paths:
+        base = p.rsplit("/", 1)[-1]
+        bl = base.lower()
+        order = next((i for i, n in enumerate(lows) if n == bl or n == p.lower()
+                      or p.lower().endswith("/" + n)), None)
+        if order is None:
+            continue
+        folder = p.rsplit("/", 1)[0].lower() if "/" in p else ""
+        if folder == COVER_FOLDER.lower():
+            tier = 0
+        elif folder.endswith("/" + COVER_FOLDER.lower()):
+            tier = 1
+        elif not folder:
+            tier = 2
+        else:
+            tier = 3
+        score = (order, tier, len(p))
+        if best is None or score < best[0]:
+            best = (score, p)
+    return best[1] if best else ""
+
+
+def archive_paths(filepath, password=None):
+    """列一次包内所有文件路径。ZIP 走标准库，其它走 7z；封面扫描和包内索引共用这一步。"""
+    if os.path.splitext(filepath)[1].lower() == ".zip":
+        ents = zip_name_fast(filepath)
+        if ents is not None:
+            return [f["path"] for f in ents]
+    try:
+        return [f["path"] for f in list_cached(filepath, password)]
+    except Exception:
+        return []
+
+
 def find_cover(filepath, password=None, names=None):
     """在包内找封面图：
        优先级 = 用户配置里的命名顺序；同名时优先 ZipPreview/ 专用目录，其次根目录，最后任意目录。
@@ -852,36 +1262,7 @@ def find_cover(filepath, password=None, names=None):
     with _cover_lock:
         if key in _cover_index:
             return _cover_index[key]
-    inner = ""
-    try:
-        entries = list_cached(filepath, password)
-    except Exception:
-        entries = []
-    if entries:
-        lows = [n.lower() for n in names]
-        best = None
-        for f in entries:
-            p = f["path"]
-            base = p.rsplit("/", 1)[-1]
-            bl = base.lower()
-            order = next((i for i, n in enumerate(lows) if n == bl or n == p.lower()
-                          or p.lower().endswith("/" + n)), None)
-            if order is None:
-                continue
-            folder = p.rsplit("/", 1)[0].lower() if "/" in p else ""
-            if folder == COVER_FOLDER.lower():
-                tier = 0
-            elif folder.endswith("/" + COVER_FOLDER.lower()):
-                tier = 1
-            elif not folder:
-                tier = 2
-            else:
-                tier = 3
-            score = (order, tier, len(p))
-            if best is None or score < best[0]:
-                best = (score, p)
-        if best:
-            inner = best[1]
+    inner = _pick_cover(archive_paths(filepath, password), names)
     with _cover_lock:
         if len(_cover_index) > 512:
             _cover_index.clear()
@@ -942,9 +1323,18 @@ def to_web_image(raw):
 
 # ==================== 路由：页面与静态 ====================
 
+@app.route("/api/ping")
+def api_ping():
+    """给新实例判断「端口上跑的是谁、哪个版本」"""
+    return jsonify({"ok": True, "app": "Zip2mmd", "version": APP_VERSION,
+                    "pid": os.getpid()})
+
+
 @app.route("/")
 def index():
-    resp = Response(PAGE_HTML, mimetype="text/html")
+    resp = Response(PAGE_HTML.replace("__API_TOKEN__", API_TOKEN)
+                    .replace("__APP_VERSION__", APP_VERSION)
+                    .replace("__APP_PORT__", str(APP_PORT)), mimetype="text/html")
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
     return resp
@@ -952,10 +1342,7 @@ def index():
 
 @app.route("/vendor/<path:name>")
 def vendor(name):
-    p = os.path.join(VENDOR_DIR, name)
-    if not os.path.isfile(p):
-        abort(404)
-    return send_file(p, max_age=86400)
+    return send_from_directory(VENDOR_DIR, name, max_age=86400)
 
 
 # ==================== 路由：元数据 ====================
@@ -968,10 +1355,29 @@ def api_meta():
 
 @app.route("/api/encryption")
 def api_encryption():
-    """后台预热的结果：{path: true/false}，未探测完的不会出现"""
-    meta = build_meta(load_config()["watch_dirs"])
-    out = {a["path"]: a["encrypted"] for a in meta["archives"] if a["encrypted"] is not None}
-    return jsonify({"map": out, "done": meta["encKnown"] >= meta["total"]})
+    """后台预热的结果：{path: true/false}，未探测完的不会出现。
+    复用最近一次 build_meta 的轻量快照，避免每次轮询都全量扫描目录。"""
+    global _enc_poll_paths
+    with _enc_poll_lock:
+        paths = list(_enc_poll_paths)
+    if not paths:  # 还没做过任何扫描，兜底扫一次
+        build_meta(load_config()["watch_dirs"])
+        with _enc_poll_lock:
+            paths = list(_enc_poll_paths)
+    # 加密状态以实时缓存为准（后台预热会往里写），快照只提供 path + 预算好的 key
+    keys = [(item[0], item[1]) for item in paths] if paths and len(paths[0]) >= 4 else []
+    if not keys:
+        keys = [(p, _enc_key(p, m, s)) for p, m, s in paths]
+    with _enc_lock:
+        enc_snapshot = {key: _enc_cache[key] for key, _ in keys if key in _enc_cache}
+    out = {}
+    known = 0
+    for path, key in keys:
+        val = enc_snapshot.get(key)
+        if val is not None:
+            out[path] = val
+            known += 1
+    return jsonify({"map": out, "done": known >= len(paths)})
 
 
 @app.route("/api/settings")
@@ -1081,7 +1487,7 @@ def api_settings_save():
     apply_tool_paths(cfg)
     with _cover_lock:
         _cover_index.clear()
-        for f in os.listdir(COVER_DIR):
+        for f in (os.listdir(COVER_DIR) if os.path.isdir(COVER_DIR) else []):
             if f.endswith(".png"):
                 try:
                     os.remove(os.path.join(COVER_DIR, f))
@@ -1154,6 +1560,8 @@ def api_cover():
 
 _cover_flag = {}
 _cover_lock = threading.Lock()
+_cover_scan_lock = threading.Lock()
+_cover_warm_started = False
 _COVER_INDEX = os.path.join(CACHE_DIR, "cover_index.json")
 
 
@@ -1171,24 +1579,59 @@ def _cover_index_load():
 
 def _cover_index_save(d):
     try:
-        tmp = _COVER_INDEX + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(d, f)
-        os.replace(tmp, _COVER_INDEX)
+        with _JSON_WRITE_LOCK:
+            _atomic_json(_COVER_INDEX, d)
     except Exception:
         pass
 
 
-@app.route("/api/covers")
-def api_covers():
-    """批量统计「有没有预览图」，给筛选和批量模式用。
-    按 路径+mtime+size 缓存，落盘到 _cache/cover_index.json，并且多线程并发探测。"""
+# 包内文件名索引：archive路径 -> [mtime, size, [包内路径...]]。
+# 和封面扫描共用一次列包，避免为每个包起两次 7z。
+_INNER_INDEX = os.path.join(CACHE_DIR, "inner_index.json")
+_inner_index = {}
+_inner_index_lock = threading.Lock()
+_inner_ready = {"v": False}
+
+
+def _inner_index_load():
+    global _inner_index
+    with _inner_index_lock:
+        if _inner_index:
+            return _inner_index
+        try:
+            with open(_INNER_INDEX, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                _inner_index = d
+        except Exception:
+            _inner_index = {}
+    return _inner_index
+
+
+def _inner_index_save(d):
+    global _inner_index
+    try:
+        with _JSON_WRITE_LOCK:
+            _atomic_json(_INNER_INDEX, d)
+    except Exception:
+        pass
+    with _inner_index_lock:
+        _inner_index = dict(d)
+
+
+def compute_cover_flags():
+    """统计封面，并顺带列一次包内文件名建索引（一次列包两用，不重复起 7z）。
+    供 API 和后台预热共用。"""
     cfg = load_config()
     names = cover_names()
     pw = cfg.get("password", DEFAULT_PASSWORD)
-    archives = scan_archives(cfg["watch_dirs"])
+    with _meta_lock:
+        archives = list(_meta_archives)
+    if not archives:
+        archives = scan_archives(cfg["watch_dirs"])
 
     disk = _cover_index_load()
+    inner_disk = _inner_index_load()
     out, todo, stamps = {}, [], {}
 
     with _cover_lock:
@@ -1203,38 +1646,111 @@ def api_covers():
             out[a["path"]] = False
             continue
         stamps[p] = stamp
-        if p in disk and isinstance(disk[p], list) and disk[p][:2] == stamp:
-            has = bool(disk[p][2])
-            _cover_flag[(p, st.st_mtime, st.st_size)] = has
+        cover_ok = p in disk and isinstance(disk[p], list) and disk[p][:2] == stamp
+        inner_ok = p in inner_disk and isinstance(inner_disk[p], list) and inner_disk[p][:2] == stamp
+        if cover_ok and inner_ok:
+            out[a["path"]] = bool(disk[p][2])
+            continue
+        if inner_ok and not cover_ok:
+            # 包内路径已有，封面直接从路径算，不用再列包
+            has = bool(_pick_cover(inner_disk[p][2], names))
+            disk[p] = stamp + [has]
+            with _cover_lock:
+                _cover_flag[(p, st.st_mtime, st.st_size)] = has
             out[a["path"]] = has
+            continue
+        if cover_ok:
+            out[a["path"]] = bool(disk[p][2])
+            todo.append(p)          # 只缺包内索引，列一次补齐
             continue
         key = (p, st.st_mtime, st.st_size)
         if key in mem:
             out[a["path"]] = mem[key]
+            todo.append(p)          # 封面在内存缓存里，但包内索引仍要列
             continue
         todo.append(p)
 
     if todo:
         def _probe(p):
-            try:
-                return p, bool(find_cover(p, pw, names))
-            except Exception:
-                return p, False
+            paths = archive_paths(p, pw)
+            return p, bool(_pick_cover(paths, names)), paths
 
-        # 7z 是外部进程，开几个线程并发探测；137 个约 0.6 秒，上万条也能接受
-        workers = min(16, max(4, (os.cpu_count() or 4) * 2))
+        workers = min(32, max(8, (os.cpu_count() or 4) * 4))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            for p, has in ex.map(_probe, todo):
-                disk[p] = stamps.get(p, [0, 0]) + [has]
-                _cover_flag[(p, stamps.get(p, [0, 0])[0], stamps.get(p, [0, 0])[1])] = has
+            for p, has, paths in ex.map(_probe, todo):
+                stamp = stamps.get(p, [0, 0])
+                disk[p] = stamp + [has]
+                inner_disk[p] = stamp + [paths]
+                st = stamps.get(p, [0, 0])
+                with _cover_lock:
+                    _cover_flag[(p, st[0], st[1])] = has
                 out[p.replace("\\", "/")] = has
 
-        # 清掉已经不存在的条目，避免索引越滚越大
         alive = set(stamps)
         disk = {k: v for k, v in disk.items() if k in alive}
+        inner_disk = {k: v for k, v in inner_disk.items() if k in alive}
         _cover_index_save(disk)
+        _inner_index_save(inner_disk)
 
-    return jsonify({"map": out, "scanned": len(todo), "total": len(archives)})
+    _inner_ready["v"] = True
+    return {"map": out, "scanned": len(todo), "total": len(archives)}
+
+
+def warm_cover_index():
+    """启动后后台补封面索引，不阻塞首屏。"""
+    global _cover_warm_started
+    if _cover_warm_started:
+        return
+    _cover_warm_started = True
+    if not _cover_scan_lock.acquire(blocking=False):
+        return
+    try:
+        compute_cover_flags()
+    except Exception:
+        pass
+    finally:
+        _cover_scan_lock.release()
+
+
+@app.route("/api/covers")
+def api_covers():
+    """返回已知封面状态；后台正在预热时立即返回缓存并标记 warming。"""
+    if not _cover_scan_lock.acquire(blocking=False):
+        disk = _cover_index_load()
+        partial = {k.replace("\\", "/"): bool(v[2]) for k, v in disk.items()
+                   if isinstance(v, list) and len(v) >= 3}
+        return jsonify({"map": partial, "scanned": 0, "total": len(partial), "warming": True})
+    try:
+        r = compute_cover_flags()
+        r["warming"] = False
+        return jsonify(r)
+    finally:
+        _cover_scan_lock.release()
+
+
+@app.route("/api/search_inner")
+def api_search_inner():
+    """全库包内文件名搜索：在已建好的索引里查，命中返回所属压缩包 + 包内路径。
+    index 还在后台预热时立即返回 warming:true，前端轮询即可。"""
+    q = (request.args.get("q", "") or "").strip().lower()
+    if not q:
+        return jsonify({"hits": [], "warming": False, "total": 0, "ready": _inner_ready["v"]})
+    if not _inner_ready["v"]:
+        return jsonify({"hits": [], "warming": True, "total": 0, "ready": False})
+    idx = _inner_index_load()
+    hits = []
+    for arc, rec in idx.items():
+        if not isinstance(rec, list) or len(rec) < 3:
+            continue
+        for inner in rec[2]:
+            if q in inner.lower():
+                hits.append({"archive": arc.replace("\\", "/"), "inner": inner,
+                             "name": inner.rsplit("/", 1)[-1]})
+                break                      # 每个包只报一条，避免几万条刷屏
+        if len(hits) >= 200:
+            break
+    return jsonify({"hits": hits, "warming": False, "total": len(hits), "ready": True,
+                    "scanned": len(idx)})
 
 
 @app.route("/api/cover/delete", methods=["POST"])
@@ -1333,10 +1849,26 @@ def api_cover_save():
     return jsonify({"ok": True, "inner": COVER_FOLDER + "/" + name})
 
 
+def _decode_ps_output(raw):
+    """解码 PowerShell 标准输出。
+    Windows PowerShell 5.1 的 [Console]::Out 默认按系统 ANSI 代码页输出，
+    中文目录（如 F:\\mmd资源）出来是 GBK 字节；强制 UTF8 后也可能有 BOM。
+    先按 UTF-8 严格解，失败再退回 GBK，最后才用 replace 兜底，避免中文路径变乱码。"""
+    if not raw:
+        return ""
+    for enc in ("utf-8-sig", "utf-8", "gbk"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
 @app.route("/api/pick_folder", methods=["POST"])
 def api_pick_folder():
     """系统原生「选择文件夹」对话框"""
     ps = (
+        "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);"
         "Add-Type -AssemblyName System.Windows.Forms | Out-Null;"
         "$f=New-Object System.Windows.Forms.Form;"
         "$f.TopMost=$true;$f.ShowInTaskbar=$false;$f.WindowState='Minimized';$f.Show();"
@@ -1350,7 +1882,7 @@ def api_pick_folder():
             ["powershell", "-NoProfile", "-STA", "-Command", ps],
             capture_output=True, timeout=300,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        out = r.stdout.decode("utf-8", "replace").strip()
+        out = _decode_ps_output(r.stdout).strip()
         return jsonify({"path": out} if out else {"error": "没有选择"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1360,6 +1892,7 @@ def api_pick_folder():
 def api_pick_file():
     """弹一个系统原生的选文件对话框（和工具在同一台机器上），返回选中的 exe 路径"""
     ps = (
+        "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);"
         "Add-Type -AssemblyName System.Windows.Forms | Out-Null;"
         "$f=New-Object System.Windows.Forms.Form;"
         "$f.TopMost=$true;$f.ShowInTaskbar=$false;$f.WindowState='Minimized';$f.Show();"
@@ -1373,7 +1906,7 @@ def api_pick_file():
             ["powershell", "-NoProfile", "-STA", "-Command", ps],
             capture_output=True, timeout=300,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        out = r.stdout.decode("utf-8", "replace").strip()
+        out = _decode_ps_output(r.stdout).strip()
         return jsonify({"path": out} if out else {"error": "没有选择文件"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1427,6 +1960,20 @@ def api_list():
     password = request.args.get("password", "") or load_config().get("password", DEFAULT_PASSWORD)
     if not os.path.isfile(filepath):
         return jsonify({"error": "文件不存在"}), 404
+    # 散资源文件：不是压缩包，构造一条指向自身的伪文件，走正常预览链路
+    if os.path.splitext(filepath)[1].lower() in LOOSE_EXTS:
+        try:
+            st = os.stat(filepath)
+        except OSError:
+            st = None
+        ext = os.path.splitext(filepath)[1].lower()
+        return jsonify({"files": [{
+            "path": "", "name": os.path.basename(filepath),
+            "size": format_size(st.st_size) if st else "",
+            "raw_size": st.st_size if st else 0,
+            "ext": ext, "is_image": ext in IMAGE_EXTS, "is_pmx": ext in PMX_EXTS,
+            "is_3d": ext in MODEL3D_EXTS, "is_archive": False, "encrypted": False,
+        }], "count": 1})
     try:
         files = list_cached(filepath, password)
         return jsonify({"files": files, "count": len(files)})
@@ -1506,7 +2053,7 @@ def api_pmx():
 
 @app.route("/api/model")
 def api_model():
-    """模型原始字节（给 three.js 的 loader 用）"""
+    """模型/音频/视频原始字节。支持 HTTP Range，浏览器 <audio>/<video> 才能拖动进度条。"""
     p = request.args.get("path", "")
     inner = request.args.get("inner", "")
     pw = request.args.get("password", "") or load_config().get("password", DEFAULT_PASSWORD)
@@ -1519,7 +2066,30 @@ def api_model():
             data = read_bytes(p, inner, None)
         except Exception as e:
             return jsonify({"error": str(e)}), 500
-    return Response(data, mimetype="application/octet-stream")
+    total = len(data)
+    rng = request.headers.get("Range", "")
+    mime = "application/octet-stream"
+    if rng.startswith("bytes="):
+        try:
+            part = rng[6:].split(",")[0].strip()
+            if "-" in part:
+                a, _, b = part.partition("-")
+                start = int(a) if a else 0
+                end = int(b) if b else total - 1
+                if start < total and end >= start:
+                    end = min(end, total - 1)
+                    chunk = data[start:end+1]
+                    resp = Response(chunk, status=206, mimetype=mime)
+                    resp.headers["Content-Range"] = "bytes %d-%d/%d" % (start, end, total)
+                    resp.headers["Accept-Ranges"] = "bytes"
+                    resp.headers["Content-Length"] = str(len(chunk))
+                    return resp
+        except (ValueError, TypeError):
+            pass
+    resp = Response(data, mimetype=mime)
+    resp.headers["Accept-Ranges"] = "bytes"
+    resp.headers["Content-Length"] = str(total)
+    return resp
 
 
 # ---------- 批量预解压：模型加载时把同目录资源一次性解出来 ----------
@@ -1639,6 +2209,166 @@ def api_prefetch():
         except OSError:
             pass
     return jsonify({"ok": True, "files": len(entries), "scope": inner_dir or "(整包)"})
+
+
+@app.route("/api/favs")
+def api_favs_get():
+    return jsonify({"favs": load_config().get("favorites") or []})
+
+
+@app.route("/api/favs", methods=["POST"])
+def api_favs_set():
+    """收藏列表：整体覆盖写；文件移动后前端会把新路径传上来"""
+    body = request.get_json(silent=True) or {}
+    favs = body.get("favs")
+    if not isinstance(favs, list):
+        return jsonify({"error": "参数不对"}), 400
+    cfg = load_config()
+    out = []
+    for x in favs:
+        x = str(x).strip()
+        if x and x not in out:
+            out.append(x)
+    cfg["favorites"] = out
+    save_config(cfg)
+    return jsonify({"ok": True, "favs": out})
+
+
+@app.route("/api/tags")
+def api_tags_get():
+    return jsonify({"tags": load_config().get("tags") or {}})
+
+
+@app.route("/api/tags", methods=["POST"])
+def api_tags_set():
+    """设置某个压缩包的标签（[] 表示清空）"""
+    body = request.get_json(silent=True) or {}
+    p = body.get("path") or ""
+    tags = body.get("tags")
+    if not p or not isinstance(tags, list):
+        return jsonify({"error": "参数不对"}), 400
+    cfg = load_config()
+    cur = cfg.get("tags") or {}
+    clean = []
+    for t in tags:
+        t = str(t).strip()
+        if t and t not in clean:
+            clean.append(t)
+    clean = clean[:12]
+    if clean:
+        cur[p] = clean
+    else:
+        cur.pop(p, None)
+    cfg["tags"] = cur
+    save_config(cfg)
+    return jsonify({"ok": True, "tags": cur, "path": p})
+
+
+@app.route("/api/gesture")
+def api_gesture_get():
+    return jsonify(_gesture_state(_profile_dir()))
+
+
+@app.route("/api/gesture", methods=["POST"])
+def api_gesture_set():
+    body = request.get_json(silent=True) or {}
+    on = bool(body.get("on"))
+    ok = _gesture_set(_profile_dir(), on)
+    return jsonify({"ok": ok, "on": on})
+
+
+@app.route("/api/backup/export")
+def api_backup_export():
+    """导出配置/收藏/标签与各索引，方便换电脑或重装后恢复。"""
+    files = {
+        "config": CONFIG_FILE, "enc": ENC_CACHE_FILE, "sfx": SFX_CACHE_FILE,
+        "cover": _COVER_INDEX, "inner": _INNER_INDEX,
+    }
+    out = {"app": "Zip2mmd", "version": APP_VERSION, "exported": int(time.time()), "files": {}}
+    for key, p in files.items():
+        try:
+            if os.path.isfile(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    out["files"][key] = json.load(f)
+        except Exception:
+            pass
+    return jsonify(out)
+
+
+@app.route("/api/backup/import", methods=["POST"])
+def api_backup_import():
+    """导入备份：只接受认识的键，值必须是 JSON 对象，全部原子写。"""
+    global _enc_cache, _sfx_cache, _inner_index
+    body = request.get_json(silent=True) or {}
+    data = body.get("data") if isinstance(body.get("data"), dict) else body
+    if data.get("app") not in (None, "Zip2mmd"):
+        return jsonify({"error": "不是 Zip2mmd 备份"}), 400
+    files = data.get("files") or {}
+    if not isinstance(files, dict):
+        return jsonify({"error": "备份格式不对"}), 400
+    paths = {
+        "config": CONFIG_FILE, "enc": ENC_CACHE_FILE, "sfx": SFX_CACHE_FILE,
+        "cover": _COVER_INDEX, "inner": _INNER_INDEX,
+    }
+    done = []
+    try:
+        with _JSON_WRITE_LOCK:
+            for key, p in paths.items():
+                if key not in files:
+                    continue
+                val = files[key]
+                if key == "config":
+                    if not isinstance(val, dict):
+                        continue
+                    _atomic_json(p, val, indent=2)
+                elif isinstance(val, dict):
+                    _atomic_json(p, val)
+                else:
+                    continue
+                done.append(key)
+        if "enc" in done:
+            load_enc_cache()
+        if "sfx" in done:
+            load_sfx_cache()
+        if "cover" in done:
+            with _cover_lock:
+                _cover_index.clear()
+        if "inner" in done:
+            with _inner_index_lock:
+                _inner_index = {}
+    except Exception as e:
+        return jsonify({"error": "导入失败：" + str(e)}), 500
+    return jsonify({"ok": True, "imported": done})
+
+
+@app.route("/api/nested/open", methods=["POST"])
+def api_nested_open():
+    """把压缩包里的压缩包解到缓存，返回真实路径，之后就能像普通包一样浏览"""
+    body = request.get_json(silent=True) or {}
+    p = body.get("path") or ""
+    inner = body.get("inner") or ""
+    ext = os.path.splitext(inner)[1].lower()
+    if not os.path.isfile(p) or not inner:
+        return jsonify({"error": "文件不存在"}), 404
+    pw = body.get("password") or load_config().get("password", DEFAULT_PASSWORD)
+    try:
+        data = read_bytes(p, inner, pw)
+    except Exception:
+        try:
+            data = read_bytes(p, inner, None)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    ensure_dirs()
+    dest_dir = os.path.join(EXTRACT_DIR, "nested")
+    os.makedirs(dest_dir, exist_ok=True)
+    name = os.path.basename(inner) or ("inner" + ext)
+    target = os.path.join(dest_dir, hashlib.md5((p + inner).encode("utf-8", "replace")).hexdigest()[:10] + "_" + name)
+    try:
+        with open(target, "wb") as f:
+            f.write(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True, "path": target})
 
 
 @app.route("/api/asset")
@@ -1785,6 +2515,8 @@ def api_open_editor():
 def fs_reveal():
     body = request.get_json(silent=True) or {}
     p = os.path.normpath(body.get("path", ""))
+    if not is_under_roots(p, allow_cache=True):
+        return jsonify({"error": "路径不在允许范围内"}), 403
     if os.path.isfile(p):
         subprocess.Popen(["explorer", "/select,", p])
     elif os.path.isdir(p):
@@ -1798,6 +2530,8 @@ def fs_reveal():
 def fs_open():
     body = request.get_json(silent=True) or {}
     p = os.path.normpath(body.get("path", ""))
+    if not is_under_roots(p, allow_cache=True):
+        return jsonify({"error": "路径不在允许范围内"}), 403
     if not os.path.isfile(p):
         return jsonify({"error": "文件不存在"}), 404
     os.startfile(p)
@@ -1809,20 +2543,27 @@ def fs_rename():
     body = request.get_json(silent=True) or {}
     p = os.path.normpath(body.get("path", ""))
     new_name = (body.get("name") or "").strip()
-    if not os.path.isfile(p):
+    is_dir = os.path.isdir(p)
+    if not (os.path.isfile(p) or is_dir):
         return jsonify({"error": "文件不存在"}), 404
     if not is_under_roots(p):
         return jsonify({"error": "只允许操作监控目录内的文件"}), 403
     if not new_name or any(c in new_name for c in '\\/:*?"<>|'):
         return jsonify({"error": "文件名不合法"}), 400
-    if not os.path.splitext(new_name)[1]:
+    # 只有文件才自动补扩展名；文件夹保持原名，不加后缀
+    if not is_dir and not os.path.splitext(new_name)[1]:
         new_name += os.path.splitext(p)[1]
     target = os.path.join(os.path.dirname(p), new_name)
     if os.path.exists(target):
         return jsonify({"error": "同名文件已存在"}), 400
     try:
         os.rename(p, target)
-        return jsonify({"ok": True, "path": target.replace("\\", "/")})
+        with _list_lock:
+            _list_cache.clear()
+        cfg = load_config()
+        return jsonify({"ok": True, "path": target.replace("\\", "/"),
+                        "meta": patch_meta(removed=[p], added=[target],
+                                           watch_dirs=cfg["watch_dirs"])})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1843,7 +2584,11 @@ def fs_mkdir():
         return jsonify({"error": "同名文件夹已存在"}), 400
     try:
         os.makedirs(target)
-        return jsonify({"ok": True, "path": target.replace("\\", "/")})
+        with _list_lock:
+            _list_cache.clear()
+        cfg = load_config()
+        return jsonify({"ok": True, "path": target.replace("\\", "/"),
+                        "meta": patch_meta(added=[target], watch_dirs=cfg["watch_dirs"])})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1856,6 +2601,7 @@ def fs_move():
     src = os.path.normpath(body.get("src", ""))
     dst_dir = os.path.normpath(body.get("dst_dir", ""))
     overwrite = bool(body.get("overwrite"))
+    no_meta = bool(body.get("no_meta"))   # 批量移动：中间步骤跳过全库重扫，最后一步再要 meta
     if not (os.path.isfile(src) or os.path.isdir(src)):
         return jsonify({"error": "源不存在"}), 404
     if not os.path.isdir(dst_dir):
@@ -1888,9 +2634,98 @@ def fs_move():
         return jsonify({"error": "移动失败：" + str(e)}), 500
     with _list_lock:
         _list_cache.clear()
+    if no_meta:
+        return jsonify({"ok": True, "path": target.replace("\\", "/")})
     cfg = load_config()
     return jsonify({"ok": True, "path": target.replace("\\", "/"),
-                    "meta": build_meta(cfg["watch_dirs"])})
+                    "meta": patch_meta(removed=[src], added=[target],
+                                       watch_dirs=cfg["watch_dirs"])})
+
+
+@app.route("/api/fs/copy", methods=["POST"])
+def fs_copy():
+    """把压缩包 / 文件夹复制到另一个目录（Ctrl+拖拽、右键「复制到…」走这里）"""
+    body = request.get_json(silent=True) or {}
+    src = os.path.normpath(body.get("src", ""))
+    dst_dir = os.path.normpath(body.get("dst_dir", ""))
+    overwrite = bool(body.get("overwrite"))
+    if not (os.path.isfile(src) or os.path.isdir(src)):
+        return jsonify({"error": "源不存在"}), 404
+    if not os.path.isdir(dst_dir):
+        return jsonify({"error": "目标目录不存在"}), 404
+    if not is_under_roots(src) or not is_under_roots(dst_dir):
+        return jsonify({"error": "只允许在监控目录内复制"}), 403
+    if os.path.isdir(src):
+        s = os.path.abspath(src).lower().rstrip("\\") + "\\"
+        if (os.path.abspath(dst_dir).lower() + "\\").startswith(s):
+            return jsonify({"error": "不能复制到它自己的子目录"}), 400
+    target = os.path.join(dst_dir, os.path.basename(src))
+    if os.path.abspath(target).lower() == os.path.abspath(src).lower():
+        return jsonify({"error": "源和目标是同一个位置"}), 400
+    if os.path.exists(target):
+        if not overwrite:
+            return jsonify({"conflict": True, "name": os.path.basename(src)}), 200
+        try:
+            if os.path.isdir(target):
+                shutil.rmtree(target)
+            else:
+                os.remove(target)
+        except Exception as e:
+            return jsonify({"error": "覆盖失败：" + str(e)}), 500
+    try:
+        if os.path.isdir(src):
+            shutil.copytree(src, target)
+        else:
+            shutil.copy2(src, target)
+    except Exception as e:
+        return jsonify({"error": "复制失败：" + str(e)}), 500
+    with _list_lock:
+        _list_cache.clear()
+    cfg = load_config()
+    return jsonify({"ok": True, "path": target.replace("\\", "/"),
+                    "meta": patch_meta(removed=[src] if overwrite else [],
+                                       added=[target],
+                                       watch_dirs=cfg["watch_dirs"])})
+
+
+@app.route("/api/cache/clear", methods=["POST"])
+def api_cache_clear():
+    """设置里的「清空缓存」：运行时缓存 + 缩略图 + 封面缓存"""
+    freed = 0
+    try:
+        freed = wipe_runtime_cache(include_thumbs=True)
+    except Exception:
+        pass
+    try:
+        for f in (os.listdir(COVER_DIR) if os.path.isdir(COVER_DIR) else []):
+            p = os.path.join(COVER_DIR, f)
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    except Exception:
+        pass
+    with _cover_lock:
+        _cover_index.clear()
+    return jsonify({"ok": True, "freed": format_size(freed)})
+
+
+@app.route("/api/log")
+def api_log():
+    """界面内查看日志最后 N 行"""
+    n = 300
+    try:
+        n = max(20, min(2000, int(request.args.get("lines", "300"))))
+    except ValueError:
+        pass
+    p = os.path.join(CACHE_DIR, "app.log")
+    lines = []
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()[-n:]
+    except Exception:
+        pass
+    return jsonify({"path": p, "lines": [ln.rstrip("\n") for ln in lines]})
 
 
 @app.route("/api/fs/trash", methods=["POST"])
@@ -1898,7 +2733,7 @@ def fs_trash():
     """删除压缩包 → 移到本工具回收站（可手动还原），不进系统回收站"""
     body = request.get_json(silent=True) or {}
     p = os.path.normpath(body.get("path", ""))
-    if not os.path.isfile(p):
+    if not (os.path.isfile(p) or os.path.isdir(p)):
         return jsonify({"error": "文件不存在"}), 404
     if not is_under_roots(p):
         return jsonify({"error": "只允许操作监控目录内的文件"}), 403
@@ -1911,9 +2746,110 @@ def fs_trash():
         n += 1
     try:
         shutil.move(p, dst)
-        return jsonify({"ok": True, "trash": dst.replace("\\", "/")})
+        with _JSON_WRITE_LOCK:
+            _atomic_json(dst + ".ztmeta.json",
+                         {"origin": p.replace("\\", "/"), "time": int(time.time())},
+                         indent=2)
+        with _list_lock:
+            _list_cache.clear()
+        cfg = load_config()
+        return jsonify({"ok": True, "trash": dst.replace("\\", "/"),
+                        "meta": patch_meta(removed=[p], watch_dirs=cfg["watch_dirs"])})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/fs/trash_batch", methods=["POST"])
+def fs_trash_batch():
+    """批量删除：一次性移到工具回收站，只重扫一次 meta，避免逐个删除时 N 次全库扫描。"""
+    body = request.get_json(silent=True) or {}
+    paths = body.get("paths") or []
+    if not isinstance(paths, list) or not paths:
+        return jsonify({"error": "没有要删除的文件"}), 400
+    ensure_dirs()
+    done, failed, removed = [], [], []
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    cfg = load_config()
+    for p0 in paths:
+        p = os.path.normpath(str(p0))
+        if not (os.path.isfile(p) or os.path.isdir(p)):
+            failed.append({"path": p, "error": "文件不存在"}); continue
+        if not is_under_roots(p):
+            failed.append({"path": p, "error": "不在允许目录"}); continue
+        dst = os.path.join(TRASH_DIR, f"{stamp}__{os.path.basename(p)}")
+        n = 1
+        while os.path.exists(dst):
+            dst = os.path.join(TRASH_DIR, f"{stamp}_{n}__{os.path.basename(p)}")
+            n += 1
+        try:
+            shutil.move(p, dst)
+            with _JSON_WRITE_LOCK:
+                _atomic_json(dst + ".ztmeta.json",
+                             {"origin": p.replace("\\", "/"), "time": int(time.time())}, indent=2)
+            done.append({"src": p, "trash": dst.replace("\\", "/")})
+            removed.append(p)
+        except Exception as e:
+            failed.append({"path": p, "error": str(e)})
+    with _list_lock:
+        _list_cache.clear()
+    return jsonify({"ok": True, "done": done, "failed": failed,
+                    "meta": patch_meta(removed=removed, watch_dirs=cfg["watch_dirs"]) if removed else None})
+
+
+@app.route("/api/fs/undo", methods=["POST"])
+def fs_undo():
+    """撤销：根据操作类型把结果还原回去。src=原位置，dst=操作后的位置。
+    move/rename 把 dst 移回 src；copy 把副本丢进回收站；trash 从回收站还原到 src。"""
+    body = request.get_json(silent=True) or {}
+    kind = body.get("kind", "")
+    src = os.path.normpath(body.get("src", ""))
+    dst = os.path.normpath(body.get("dst", ""))
+    if not src or not dst:
+        return jsonify({"error": "缺少路径"}), 400
+    # 回收站里取回时源在缓存目录，其余情况源必须在监控目录内
+    if not is_under_roots(dst, allow_cache=(kind == "trash")):
+        return jsonify({"error": "路径不在允许范围"}), 403
+
+    if kind == "copy":
+        # 不硬删副本，移到回收站更稳妥。src 此时是「副本路径」，dst 不用。
+        if not is_under_roots(src):
+            return jsonify({"error": "副本不在允许范围"}), 403
+        ensure_dirs()
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        trash_dst = os.path.join(TRASH_DIR, f"{stamp}__undo__{os.path.basename(src)}")
+        n = 1
+        while os.path.exists(trash_dst):
+            trash_dst = os.path.join(TRASH_DIR, f"{stamp}_{n}__undo__{os.path.basename(src)}")
+            n += 1
+        try:
+            shutil.move(src, trash_dst)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        with _list_lock:
+            _list_cache.clear()
+        cfg = load_config()
+        return jsonify({"ok": True, "path": trash_dst.replace("\\", "/"),
+                        "meta": patch_meta(removed=[src], watch_dirs=cfg["watch_dirs"])})
+
+    # move / rename / trash：把 dst 移回 src
+    if not is_under_roots(src):
+        return jsonify({"error": "原位置不在允许范围"}), 403
+    if os.path.exists(src):
+        return jsonify({"error": "原位置已有同名文件，无法撤销"}), 400
+    os.makedirs(os.path.dirname(src), exist_ok=True)
+    try:
+        shutil.move(dst, src)
+        try:
+            os.remove(dst + ".ztmeta.json")
+        except Exception:
+            pass
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    with _list_lock:
+        _list_cache.clear()
+    cfg = load_config()
+    return jsonify({"ok": True, "path": src.replace("\\", "/"),
+                    "meta": patch_meta(removed=[dst], added=[src], watch_dirs=cfg["watch_dirs"])})
 
 
 @app.route("/api/fs/extract", methods=["POST"])
@@ -1925,10 +2861,14 @@ def fs_extract():
     target = body.get("target") or ""
     if not os.path.isfile(p):
         return jsonify({"error": "文件不存在"}), 404
+    if not is_under_roots(p):
+        return jsonify({"error": "压缩包不在监控目录内"}), 403
     if not target:
         stem = os.path.splitext(os.path.basename(p))[0]
         target = os.path.join(os.path.dirname(p), stem)
     target = os.path.normpath(target)
+    if not is_under_roots(target):
+        return jsonify({"error": "目标目录不在监控目录内"}), 403
     try:
         os.makedirs(target, exist_ok=True)
         if not extract_all(p, pw, target):
@@ -1943,6 +2883,180 @@ def trash_open():
     ensure_dirs()
     subprocess.Popen(["explorer", TRASH_DIR])
     return jsonify({"ok": True})
+
+
+def _in_trash_dir(p):
+    try:
+        base = os.path.realpath(TRASH_DIR)
+        real = os.path.realpath(os.path.abspath(p))
+        return os.path.commonpath([base, real]) == base and real != base
+    except Exception:
+        return False
+
+
+@app.route("/api/trash/list")
+def trash_list():
+    ensure_dirs()
+    items = []
+    try:
+        for e in os.scandir(TRASH_DIR):
+            if e.name.endswith(".ztmeta.json"):
+                continue
+            origin = ""
+            try:
+                with open(e.path + ".ztmeta.json", "r", encoding="utf-8") as f:
+                    origin = (json.load(f).get("origin") or "")
+            except Exception:
+                pass
+            try:
+                st = e.stat(follow_symlinks=False)
+                # 文件夹要递归统计，否则卡片永远显示 0 B
+                raw = cache_size(e.path) if e.is_dir(follow_symlinks=False) else st.st_size
+                mtime = st.st_mtime
+            except Exception:
+                raw, mtime = 0, 0
+            items.append({"path": e.path.replace("\\", "/"), "name": e.name,
+                          "origin": origin, "size": format_size(raw),
+                          "raw_size": raw, "mtime": mtime,
+                          "is_dir": e.is_dir(follow_symlinks=False)})
+    except OSError:
+        pass
+    items.sort(key=lambda x: x.get("mtime", 0), reverse=True)
+    return jsonify({"items": items, "total": len(items),
+                    "size": format_size(sum(x["raw_size"] for x in items))})
+
+
+@app.route("/api/trash/restore", methods=["POST"])
+def trash_restore():
+    body = request.get_json(silent=True) or {}
+    p = os.path.normpath(body.get("path", ""))
+    if not p or not _in_trash_dir(p):
+        return jsonify({"error": "不在回收站内"}), 403
+    origin = str(body.get("origin") or "").strip()
+    if not origin:
+        try:
+            with open(p + ".ztmeta.json", "r", encoding="utf-8") as f:
+                origin = (json.load(f).get("origin") or "")
+        except Exception:
+            pass
+    if origin:
+        origin = os.path.normpath(origin)
+        if not is_under_roots(origin):
+            return jsonify({"error": "原位置不在监控目录内"}), 403
+    else:
+        roots = load_config().get("watch_dirs") or []
+        if not roots:
+            return jsonify({"error": "没有可还原的目录"}), 400
+        origin = os.path.join(roots[0], os.path.basename(p))
+    if os.path.exists(origin):
+        return jsonify({"error": "原位置已有同名文件"}), 400
+    try:
+        os.makedirs(os.path.dirname(origin), exist_ok=True)
+        shutil.move(p, origin)
+        try:
+            os.remove(p + ".ztmeta.json")
+        except Exception:
+            pass
+        with _list_lock:
+            _list_cache.clear()
+        cfg = load_config()
+        return jsonify({"ok": True, "path": origin.replace("\\", "/"),
+                        "meta": patch_meta(added=[origin], watch_dirs=cfg["watch_dirs"])})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/trash/empty", methods=["POST"])
+def trash_empty():
+    ensure_dirs()
+    n = 0
+    try:
+        for e in os.scandir(TRASH_DIR):
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    shutil.rmtree(e.path)
+                else:
+                    os.remove(e.path)
+                n += 1
+            except Exception:
+                pass
+    except OSError:
+        pass
+    return jsonify({"ok": True, "removed": n})
+
+
+@app.route("/api/duplicates")
+def api_duplicates():
+    """重复资源扫描：同名 / 同大小+修改时间 / MD5 精确。只返回分组，不做任何删除。"""
+    raw = (request.args.get("mode", "name") or "name").lower()
+    modes = [m for m in dict.fromkeys(raw.split(",")) if m in ("name", "size", "md5")]
+    if not modes:
+        modes = ["name"]
+    with _meta_lock:
+        arch = list(_meta_archives)
+    if not arch:
+        cfg = load_config()
+        arch = build_meta(cfg["watch_dirs"])["archives"]
+
+    def item_of(a):
+        return {
+            "path": a.get("path"), "name": a.get("name"), "ext": a.get("ext"),
+            "badge": a.get("badge"), "size": a.get("size"), "raw_size": a.get("raw_size", 0),
+            "mtime": a.get("mtime", 0), "dir": a.get("dir"), "rel": a.get("rel"),
+            "root": a.get("root"), "encrypted": a.get("encrypted"),
+        }
+
+    groups = []
+    hashed = 0
+    for mode in modes:
+        if mode == "name":
+            buckets = {}
+            for a in arch:
+                k = (a.get("name") or "").lower()
+                if k:
+                    buckets.setdefault(k, []).append(a)
+        elif mode == "size":
+            buckets = {}
+            for a in arch:
+                k = (a.get("raw_size", 0), a.get("mtime", 0))
+                buckets.setdefault(k, []).append(a)
+        else:
+            by_size = {}
+            for a in arch:
+                by_size.setdefault(a.get("raw_size", 0), []).append(a)
+            buckets = {}
+            for size, same in by_size.items():
+                if len(same) < 2:
+                    continue
+                for a in same:
+                    p = a.get("path", "")
+                    if not p or not os.path.isfile(p):
+                        continue
+                    h = hashlib.md5()
+                    try:
+                        with open(p, "rb") as f:
+                            while True:
+                                chunk = f.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                h.update(chunk)
+                        hashed += 1
+                    except Exception:
+                        continue
+                    buckets.setdefault((size, h.hexdigest()), []).append(a)
+
+        for k, same in buckets.items():
+            if len(same) < 2:
+                continue
+            same = sorted(same, key=lambda x: (x.get("path") or ""))
+            waste = sum(int(x.get("raw_size", 0)) for x in same[1:])
+            groups.append({"key": mode + ":" + str(k), "reason": mode, "wasted": waste,
+                           "items": [item_of(x) for x in same]})
+    groups.sort(key=lambda g: (-g["wasted"], -len(g["items"]), g["key"]))
+    return jsonify({"ok": True, "mode": ",".join(modes), "modes": modes, "groups": groups,
+                    "scanned": len(arch), "hashed": hashed,
+                    "total": sum(len(g["items"]) for g in groups),
+                    "wasted": sum(g["wasted"] for g in groups)})
 
 
 @app.route("/api/browse", methods=["POST"])
@@ -2008,7 +3122,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Zip2mmd</title>
+<title>Zip2mmd v__APP_VERSION__ :__APP_PORT__</title>
 <link rel="icon" type="image/png" href="/icon.png">
 <link rel="shortcut icon" type="image/x-icon" href="/favicon.ico">
 <style>
@@ -2017,7 +3131,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   --text:#17171c; --text2:#65656f; --text3:#9c9ca6;
   --accent:#3b6ef5; --accent-soft:#eef3ff;
   --green:#1f9d63; --red:#dc4c4c; --purple:#7c5cf0;
-  --side-w:250px; --view-w:440px;
+  --side-w:250px; --view-w:440px; --foot-h:260px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
@@ -2028,17 +3142,39 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Micr
 ::-webkit-scrollbar-track{background:transparent}
 button,input,select{font-family:inherit}
 
-#sidebar{width:var(--side-w);flex:0 0 var(--side-w);height:100vh;overflow-y:auto;overflow-x:hidden;
-  background:#fff;border-right:1px solid var(--line);padding:14px 12px 40px}
+#sidebar{width:var(--side-w);flex:0 0 var(--side-w);height:100vh;overflow:hidden;
+  background:#fff;border-right:1px solid var(--line);display:flex;flex-direction:column}
+.side-fixed{flex:none;padding:14px 12px 0}
+.side-fixed.side-foot{padding:0 12px 14px;border-top:1px solid var(--line);background:#fff}
+.side-scroll{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding:0 12px}
 .brand{display:flex;align-items:center;gap:8px;padding:2px 6px 14px;cursor:default;user-select:none}
 .brand .dot{width:22px;height:22px;border-radius:7px;background:linear-gradient(135deg,#3b6ef5,#7c5cf0);flex:none}
-.brand .logo{width:24px;height:24px;border-radius:7px;flex:none;display:block}
-.brand h1{font-size:14px;font-weight:650;letter-spacing:.2px;white-space:nowrap}
+.brand .logo{width:24px;height:24px;border-radius:7px;flex:none;display:block;cursor:pointer}
+.brand h1{font-size:14px;font-weight:650;letter-spacing:.2px;white-space:nowrap;cursor:pointer}
 .srow{display:flex;gap:6px;align-items:center;margin-bottom:8px}
 .srow .grow{flex:1;min-width:0}
-.sinput{width:100%;height:34px;border:1px solid var(--line2);border-radius:8px;padding:0 10px;
+.sinput{width:100%;height:34px;border:1px solid var(--line2);border-radius:8px;padding:0 30px 0 10px;
   font-size:13px;background:#fff;outline:none;color:var(--text)}
 .sinput:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(59,110,245,.1)}
+/* 搜索历史：自定义下拉，箭头悬停出现，面板半透明白 */
+.sbox{position:relative;flex:1;min-width:0}
+.histArrow{position:absolute;right:4px;top:50%;transform:translateY(-50%);width:22px;height:22px;
+  display:flex;align-items:center;justify-content:center;color:var(--text3);font-size:11px;cursor:pointer;
+  opacity:0;transition:opacity .12s;background:transparent;border:none;border-radius:5px;padding:0}
+.sbox:hover .histArrow,.histArrow.on{opacity:1}
+.histArrow:hover{background:#ececf2;color:var(--accent)}
+.histPanel{position:fixed;z-index:210;min-width:180px;max-width:min(320px,90vw);
+  background:rgba(255,255,255,.95);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border:1px solid var(--line);border-radius:9px;box-shadow:0 10px 28px rgba(0,0,0,.14);
+  padding:5px;max-height:300px;overflow:auto}
+.histPanel.hide{display:none}
+.histPanel .hi{display:flex;align-items:center;gap:6px;padding:7px 9px;font-size:12.5px;border-radius:6px;
+  cursor:pointer;color:var(--text)}
+.histPanel .hi:hover{background:var(--accent-soft);color:var(--accent)}
+.histPanel .hi .x{margin-left:auto;color:var(--text3);font-size:11px;opacity:0;padding:0 3px}
+.histPanel .hi:hover .x{opacity:1}
+.histPanel .hi .x:hover{color:var(--red)}
+.histPanel .hempty{padding:9px;color:var(--text3);font-size:12px;text-align:center}
 .entry{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:9px;cursor:pointer;
   font-size:13.5px;color:#2e2e36;user-select:none;white-space:nowrap;overflow:hidden}
 .entry:hover{background:#f5f5f8}
@@ -2046,19 +3182,27 @@ button,input,select{font-family:inherit}
 .entry .n{margin-left:auto;font-size:11px;color:var(--text3);font-weight:400;flex:none}
 .entry.on .n{color:var(--accent)}
 .entry .t{overflow:hidden;text-overflow:ellipsis}
-.entry .chev{width:12px;flex:none;font-size:9px;color:var(--text3);transition:transform .15s}
+.entry .chev{width:14px;height:16px;flex:none;font-size:9px;color:var(--text3);transition:transform .15s;
+  display:inline-flex;align-items:center;justify-content:center;border-radius:4px}
+.entry .chev:hover{background:#ececf2;color:var(--text)}
 .entry.folded .chev{transform:rotate(-90deg)}
 .entry.sub{padding-left:26px;font-size:12.8px;color:#4a4a54}
 .entry.sub .ico{font-size:12px;opacity:.75}
 .divider{height:1px;background:var(--line);margin:10px 4px}
 .slabel{font-size:11px;font-weight:600;color:var(--text3);letter-spacing:.5px;padding:0 8px;margin:12px 0 6px}
+.slabel.navhead{display:flex;align-items:center}
+.navtools{display:inline-flex;align-items:center;gap:3px;margin-left:auto}
+.navtool{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;
+  border:none;border-radius:5px;background:transparent;color:#6b7280;cursor:pointer}
+.navtool:hover{background:#ececf2;color:var(--accent)}
 .sitem{display:flex;align-items:center;gap:8px;padding:9px 10px;border-radius:9px;cursor:pointer;font-size:13.5px;color:#2e2e36}
 .sitem:hover{background:#f5f5f8}
 .statline{font-size:11px;color:var(--text3);padding:10px 8px 0;line-height:1.8}
 
 #center{flex:1;min-width:0;display:flex;flex-direction:column;height:100vh}
 .toolbar{height:52px;flex:none;background:#fff;border-bottom:1px solid var(--line);
-  display:flex;align-items:center;gap:8px;padding:0 16px;overflow-x:auto}
+  display:flex;align-items:center;gap:8px;padding:0 16px;overflow-x:auto;white-space:nowrap}
+.toolbar select.fbtn{height:28px;line-height:1}
 .toolbar2{height:42px;gap:6px;background:#fcfcfe}
 .toolbar2 .hint{color:var(--text3);font-size:11.5px}
 .toolbar .sep{width:1px;height:20px;background:var(--line2);flex:none}
@@ -2079,25 +3223,77 @@ button,input,select{font-family:inherit}
 .card{background:#fff;border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:pointer;transition:.14s;position:relative}
 .card:hover{border-color:#c7cdff;box-shadow:0 4px 14px rgba(59,110,245,.12);transform:translateY(-1px)}
 .card.dragging{opacity:.4}
-.card.sel{outline:2px solid var(--accent);outline-offset:-2px;background:#f3f7ff}
+/* 点击按钮/下拉/芯片时不要浏览器默认的黑框；只保留 .card.kb 的键盘定位框 */
+button:focus, .fbtn:focus, .tgchip:focus, .tagbtn:focus, .tgitem:focus,
+.vmdd-btn:focus, .vmdd-it:focus, [data-nav]:focus, select:focus{outline:none}
+/* 批量选中：只改边框颜色和背景，边框粗细始终和未选中一致，不叠加内阴影 */
+.card{border-width:1px}
+.card.sel{border:1px solid var(--accent);background:#f3f7ff;box-shadow:none}
+/* 键盘焦点：用 outline，不改 border / box-shadow，避免影响批量模式的边框一致性 */
+.card.kb{outline:2px solid var(--accent);outline-offset:-2px}
+.tag.tg{background:#eef3ff;color:#3b6ef5;border:1px solid #d9e2ff}
+/* 底部固定的分页条（不随列表滚动） */
+.pagerbar{flex:none;border-top:1px solid var(--line);background:#fff;padding:6px 10px 8px}
+.pagerbar.hide{display:none}
+.pagerbar .pager{padding:0}
+/* 分栏按钮文字在「全部 / N 项」之间变，固定宽度免得把后面按钮挤得来回动 */
+#secBtn{width:100px;flex:0 0 100px;justify-content:center;overflow:hidden;white-space:nowrap}
+#secBtn #secLbl{color:var(--text3);overflow:hidden;text-overflow:ellipsis}
+#secPanel{width:min(404px,92vw);padding:9px;background:rgba(255,255,255,.95);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
+#secList{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
+#secList .fbtn{width:100%;height:27px;padding:0 4px;display:inline-flex;align-items:center;justify-content:center;font-size:12px;line-height:1;box-sizing:border-box;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 卡片：收藏星标（悬停出现）+ 右下角时间 */
+.card .box{position:relative}
+.card .star{position:absolute;top:6px;right:6px;z-index:4;width:23px;height:23px;padding:0;
+  display:flex;align-items:center;justify-content:center;border:none;border-radius:7px;
+  background:rgba(255,255,255,.9);color:#c9c9d2;font-size:14px;line-height:1;cursor:pointer;
+  opacity:0;transition:opacity .12s,color .12s,transform .12s;box-shadow:0 1px 4px rgba(0,0,0,.12)}
+.card:hover .star{opacity:1}
+.card .star:hover{transform:scale(1.12)}
+.card .star.on{opacity:1;color:#f5a623}
+.card .ctime{position:absolute;right:6px;bottom:6px;z-index:3;font-size:10.5px;line-height:1;
+  color:#4a4a54;background:rgba(255,255,255,.82);padding:3px 5px;border-radius:5px}
+/* ---------- 分页（和 MyVedios 一致：页码窗口 + 跳转 + 每页条数） ---------- */
+.pager{display:flex;align-items:center;gap:5px;justify-content:center;padding:14px 8px 6px;flex-wrap:wrap}
+.pg{min-width:30px;height:30px;padding:0 8px;border-radius:7px;border:1px solid var(--line2);background:#fff;
+  font-size:12px;color:#3c3c46;cursor:pointer;line-height:1}
+.pg:hover{background:#f5f5f8}
+.pg.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.pg[disabled]{opacity:.4;cursor:default}
+.pg.ell{background:transparent;border:none;cursor:default;color:var(--text3)}
+.pager .lbl{font-size:11.5px;color:var(--text3)}
+.pager input{width:54px;height:30px;border:1px solid var(--line2);border-radius:7px;padding:0 6px;
+  font-size:12px;outline:none;text-align:center;box-sizing:border-box}
+.pager input::-webkit-outer-spin-button,.pager input::-webkit-inner-spin-button{-webkit-appearance:none;appearance:none;margin:0}
+.pager input[type=number]{-moz-appearance:textfield;appearance:textfield}
+.fpanel .fbtn.tgchip{height:24px;padding:0 9px;font-size:11.5px}
 .srow{position:relative}
 /* 筛选面板：向右弹出的浮层。
    用 position:fixed 才不会侧边栏的 overflow-x:hidden 裁掉（以前 absolute 往右弹看不见），
    具体位置由 JS 按按钮的位置算，右边放不下就翻到左边。 */
-.fpanel{position:fixed;z-index:200;width:236px;background:#fff;border:1px solid var(--line);
+.fpanel{position:fixed;z-index:200;width:236px;max-width:min(460px,92vw);
+  background:rgba(255,255,255,.95);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border:1px solid var(--line);
   border-radius:10px;box-shadow:0 12px 32px rgba(0,0,0,.16);padding:11px;
   display:flex;flex-direction:column;gap:10px}
 .fpanel.hide{display:none}
 .fpanel .fgroup{display:flex;flex-direction:column;gap:5px}
 .fpanel .flabel{font-size:11px;color:var(--text3);line-height:1}
-.fpanel .frow{display:flex;gap:6px;flex-wrap:nowrap}
-/* 三颗筛选按钮统一高度，避免一行里参差 */
-.fpanel .frow .fbtn{flex:1 1 0;height:26px;padding:0 6px;display:inline-flex;align-items:center;
+.fpanel .frow{display:flex;gap:6px;flex-wrap:wrap}
+/* 筛选按钮统一高度；允许换行，避免窄面板里挤出去 */
+.fpanel .frow .fbtn{flex:1 1 0;min-width:52px;height:26px;padding:0 6px;display:inline-flex;align-items:center;
   justify-content:center;font-size:12px;line-height:1;box-sizing:border-box}
-.batchbar{display:flex;align-items:center;gap:6px;padding:6px 10px;margin:8px 0;
-  background:#eef3ff;border:1px solid #d9e2ff;border-radius:9px;min-height:34px;box-sizing:border-box}
+.batchbar{display:flex;flex-direction:column;align-items:stretch;gap:5px;padding:6px 10px;margin:8px 0;
+  background:#eef3ff;border:1px solid #d9e2ff;border-radius:9px;box-sizing:border-box}
 .batchbar.hide{display:none}
-.batchbar .bcount{font-size:12px;color:var(--accent);font-weight:600;margin-right:4px}
+.batchbar .brow{display:flex;align-items:center;gap:6px;flex-wrap:nowrap;overflow-x:auto;white-space:nowrap}
+.batchbar .brow::-webkit-scrollbar{height:5px}
+.batchbar .brow::-webkit-scrollbar-thumb{background:#c9d4ee;border-radius:3px}
+.batchbar .bcount{font-size:12px;color:var(--accent);font-weight:600;margin-right:4px;flex:none}
+.taskbar{display:flex;align-items:center;gap:8px;padding:4px 10px;margin:0 0 8px;background:#f4f6fb;border:1px solid var(--line2);border-radius:8px;font-size:11.5px;color:var(--text2)}
+.taskbar.hide{display:none}
+.taskbar .bar{flex:0 0 120px;height:3px;background:#e6e8ef;border-radius:2px;overflow:hidden}
+.taskbar .bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .12s}
 .entry.drop{background:#e8f0ff;box-shadow:inset 0 0 0 2px var(--accent);border-radius:6px}
 .card .box{height:104px;background:#f3f4f8;display:flex;align-items:center;justify-content:center;overflow:hidden;position:relative}
 .card .box img{width:100%;height:100%;object-fit:cover;display:block}
@@ -2105,6 +3301,7 @@ button,input,select{font-family:inherit}
 .card .box .ext{font-size:11.5px;letter-spacing:.8px;color:#9aa0b4;font-weight:650}
 .card .info{padding:7px 9px}
 .card .fn{font-size:11.8px;line-height:1.32;word-break:break-all;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.card .fn mark{background:#fff2a8;color:inherit;border-radius:2px;padding:0 1px}
 .card .fs{font-size:10.5px;color:var(--text3);margin-top:3px;display:flex;gap:5px;align-items:center;flex-wrap:wrap}
 .tag{background:#eef0f6;color:#6b7280;padding:1px 5px;border-radius:4px;font-size:9.5px;font-weight:600}
 .tag.sfx{background:#fff1e6;color:#c2410c}
@@ -2153,6 +3350,9 @@ button,input,select{font-family:inherit}
 .vsplit{width:5px;flex:0 0 5px;cursor:col-resize;background:transparent;position:relative;z-index:70}
 .vsplit::after{content:"";position:absolute;top:0;bottom:0;left:2px;width:1px;background:var(--line)}
 .vsplit:hover::after,.vsplit.drag::after{background:var(--accent);width:2px;left:1px}
+.hsplit{height:5px;flex:0 0 5px;cursor:row-resize;background:transparent;position:relative;z-index:70}
+.hsplit::after{content:"";position:absolute;left:0;right:0;top:2px;height:1px;background:var(--line)}
+.hsplit:hover::after,.hsplit.drag::after{background:var(--accent);height:2px;top:1px}
 body.side-collapsed .vsplit.side,body.view-collapsed .vsplit.view{display:none}
 body.resizing{cursor:col-resize!important;user-select:none}
 body.resizing *{cursor:col-resize!important}
@@ -2220,6 +3420,7 @@ body.resizing *{cursor:col-resize!important}
 body.side-collapsed #sideTab{left:0}
 body.view-collapsed #viewTab{right:0}
 #sidebar.hide{width:0;flex:0 0 0;padding:0;border:0;overflow:hidden}
+#sidebar.hide > *{display:none}
 
 #viewer{width:var(--view-w);flex:0 0 var(--view-w);height:100vh;background:#fff;border-left:1px solid var(--line);
   display:flex;flex-direction:column}
@@ -2242,6 +3443,16 @@ body.view-collapsed #viewTab{right:0}
 .vbadge{position:absolute;left:10px;top:10px;background:rgba(255,255,255,.92);border:1px solid var(--line);
   border-radius:7px;padding:4px 8px;font-size:10.5px;color:var(--text2);display:none}
 .vbadge.show{display:block}
+/* 视图导航球：右上角，Blender 式快速回正 */
+.vnavball{position:absolute;right:10px;top:10px;z-index:8;width:132px;padding:6px;border-radius:10px;
+  background:rgba(255,255,255,.95);border:1px solid var(--line);box-shadow:0 2px 10px rgba(0,0,0,.08);
+  display:none;grid-template-columns:repeat(3,1fr);gap:4px}
+.vnavball.show{display:grid}
+.vnavball button{height:30px;border:1px solid var(--line2);background:#fff;border-radius:6px;cursor:pointer;
+  font-size:11px;color:var(--text2);display:flex;align-items:center;justify-content:center;padding:0}
+.vnavball button:hover{background:#eef1fb;color:var(--accent);border-color:var(--accent)}
+.vnavball button.home{grid-column:1/-1;color:var(--accent);font-weight:600}
+.vnavball.locked{opacity:.45;pointer-events:none}
 .shotguide{position:absolute;inset:8px;border:2px dashed rgba(59,110,245,.9);border-radius:6px;
   background:rgba(59,110,245,.05);display:flex;align-items:flex-end;justify-content:center;
   padding-bottom:12px;z-index:60;pointer-events:none}
@@ -2249,7 +3460,6 @@ body.view-collapsed #viewTab{right:0}
 .shotbar{pointer-events:auto;display:flex;align-items:center;gap:8px;background:rgba(255,255,255,.96);
   border:1px solid var(--line);border-radius:9px;padding:6px 9px;box-shadow:0 6px 20px rgba(0,0,0,.14)}
 .shotbar .shotip{font-size:11.5px;color:var(--text3)}
-.vfoot{flex:none;border-top:1px solid var(--line);padding:10px 12px;max-height:38vh;overflow-y:auto}
 .vrow{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
 .lightrow{display:flex;align-items:center;gap:8px;margin-bottom:9px;font-size:11.5px;color:var(--text3)}
 .lightrow label{width:32px;flex:none}
@@ -2258,6 +3468,90 @@ body.view-collapsed #viewTab{right:0}
 .lightrow span{width:38px;text-align:right;flex:none}
 .lightrow .chk{display:flex;align-items:center;gap:4px;width:auto;flex:none;cursor:pointer;user-select:none;white-space:nowrap}
 .lightrow .chk input{width:13px;height:13px;margin:0;accent-color:var(--accent);cursor:pointer}
+
+/* ---------- VMD 管理面板 + 播放条 ---------- */
+.vmbar{display:none;position:absolute;left:10px;right:10px;bottom:18px;z-index:6;align-items:center;gap:7px;
+  padding:7px 9px;border:1px solid #e4d6f5;border-radius:9px;background:rgba(251,248,255,.96);
+  box-shadow:0 4px 18px rgba(90,60,140,.16)}
+.vmbar.on{display:flex}
+.vmbar.hide{display:none}
+.vmbar .vmplay{flex:none;width:32px;height:28px;border:1px solid var(--accent);border-radius:7px;background:var(--accent);color:#fff;
+  font-size:13px;cursor:pointer;padding:0}
+.vmbar .vmplay:hover{background:#2f5cd8}
+.vmbar input[type=range][data-vmseek]{flex:1;min-width:110px;accent-color:#8b5cf6;height:5px;cursor:pointer}
+.vmbar .vmvol{position:relative;flex:none;display:inline-flex;align-items:center;color:#6b4fa8;font-size:14px;line-height:1;user-select:none}
+.vmbar .vmvol .vmvolico{cursor:pointer;width:18px;text-align:center}
+.vmbar .vmvolpop{position:absolute;left:50%;bottom:100%;transform:translateX(-50%) translateY(4px);
+  display:flex;align-items:center;justify-content:center;padding:9px 10px 10px;border:1px solid #e4d6f5;border-radius:8px;
+  background:rgba(251,248,255,.98);box-shadow:0 5px 18px rgba(90,60,140,.18);
+  opacity:0;visibility:hidden;pointer-events:none;transition:opacity .14s,transform .14s;z-index:10}
+.vmbar .vmvol:hover .vmvolpop,.vmbar .vmvolpop:hover{opacity:1;visibility:visible;transform:translateX(-50%) translateY(0);pointer-events:auto}
+/* 竖向滑块，向上音量增大；紧贴图标（bottom:100%）让鼠标移入途中 hover 不断 */
+.vmbar input[type=range][data-vmvol]{display:block;width:5px;height:92px;accent-color:#8b5cf6;cursor:pointer;
+  writing-mode:vertical-lr;direction:rtl}
+.vmbar .vmt{font-size:11px;color:#6b4fa8;font-variant-numeric:tabular-nums;flex:none;min-width:82px;text-align:center}
+.vmbar select{height:26px;border:1px solid #d9c9f0;border-radius:6px;padding:0 5px;font-size:11.5px;color:#5b3f8c;background:#fff;outline:none}
+.vmbar .vmlp{flex:none;height:26px;padding:0 9px;border:1px solid var(--line2);border-radius:6px;background:#fff;
+  color:var(--text2);font-size:11.5px;cursor:pointer}
+.vmbar .vmlp.on{background:#22c55e;border-color:#22c55e;color:#fff}
+/* 中间缝隙的播放条收起手柄：与侧栏/视口 edge-tab 同一风格，上下方向 */
+.vmbartab{position:absolute;left:50%;transform:translateX(-50%);bottom:0;z-index:7;display:none;
+  width:64px;height:13px;display:none;align-items:center;justify-content:center;
+  background:#fff;border:1px solid var(--line2);border-bottom:0;border-radius:8px 8px 0 0;
+  cursor:pointer;color:var(--text2);font-size:10px;line-height:1;user-select:none;
+  box-shadow:0 -2px 7px rgba(0,0,0,.05);transition:background .15s}
+.vmbartab:hover{background:#eef1fb;color:var(--accent)}
+.vmbartab.on{display:flex}
+
+.vfoot{flex:none;border-top:1px solid var(--line);height:var(--foot-h);min-height:90px;display:flex}
+.footnav{width:34px;flex:none;border-right:1px solid var(--line);background:#fafafe;display:flex;flex-direction:column;
+  align-items:center;gap:4px;padding:7px 4px}
+.foottab{width:26px;padding:8px 0;border:1px solid transparent;border-radius:6px;background:none;color:var(--text3);
+  font-size:11px;line-height:1.1;cursor:pointer;writing-mode:vertical-rl;text-orientation:upright;font-family:inherit}
+.foottab:hover{background:#f0f0f5}
+.foottab.on{background:#eef3ff;border-color:#d9e2ff;color:var(--accent);font-weight:600}
+.footpanes{flex:1;min-width:0;overflow-y:auto;padding:10px 12px}
+.footpane{display:none}
+.footpane.on{display:block}
+.footpane.vmdrop{background:#eef3ff;box-shadow:inset 0 0 0 2px var(--accent)}
+
+/* 管理面板顶部：音频 + 镜头 同一行，各一个下拉 */
+.vmtop{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.vmtop .vmgrp{display:flex;align-items:center;gap:6px;flex:1;min-width:0}
+.vmtop .vmgrp>span{font-size:11px;color:var(--text3);flex:none}
+.vmtop select{flex:1;min-width:0;height:27px;border:1px solid var(--line2);border-radius:6px;padding:0 7px;
+  font-size:11.5px;color:var(--text);background:#fff;outline:none}
+/* 模型/音频下拉：候选项悬停出现 ×，直接从池里移除 */
+.vmdd-btn{flex:1;min-width:0;width:100%;height:27px;border:1px solid var(--line2);border-radius:6px;padding:0 7px;
+  font-size:11.5px;color:var(--text);background:#fff;outline:none;display:flex;align-items:center;gap:4px;cursor:pointer}
+.vmdd-btn:hover{border-color:var(--accent)}
+.vmdd-btn .vmdd-lb{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.vmdd-btn .vmdd-ar{font-size:9px;color:var(--text3);flex:none}
+.vmdd-pop{position:fixed;z-index:215;min-width:160px;max-width:290px;max-height:260px;overflow-y:auto;
+  background:rgba(255,255,255,.97);border:1px solid var(--line);border-radius:9px;
+  box-shadow:0 10px 28px rgba(0,0,0,.16);padding:4px}
+.vmdd-it{display:flex;align-items:center;gap:6px;padding:6px 8px;border-radius:6px;
+  font-size:11.5px;color:var(--text);cursor:pointer}
+.vmdd-it:hover{background:var(--accent-soft)}
+.vmdd-it.on{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.vmdd-it .vmdd-nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.vmdd-it .vmdd-x{flex:none;width:17px;height:17px;border:none;border-radius:4px;background:transparent;
+  color:var(--text3);font-size:12px;cursor:pointer;line-height:1;opacity:0;padding:0;font-family:inherit}
+.vmdd-it:hover .vmdd-x{opacity:1}
+.vmdd-it .vmdd-x:hover{background:#ffefef;color:var(--red)}
+.vmrows{display:flex;flex-direction:column;gap:5px}
+.vmrow{display:grid;grid-template-columns:22px minmax(0,1fr) minmax(0,1fr) 24px 38px 24px;gap:5px;align-items:center}
+.vmrow .vmaddmo{font-size:10.5px!important;letter-spacing:-.3px}
+.vmextra{display:grid;grid-template-columns:22px minmax(0,1fr) minmax(0,1fr) 24px 38px 24px;gap:5px;align-items:center}
+.vmextra select,.vmextra .vmdd-btn{grid-column:3}
+.vmextra button{grid-column:6}
+.vmrow .idx{font-size:11px;color:var(--text3);text-align:center;font-variant-numeric:tabular-nums}
+.vmrow select{width:100%;min-width:0;height:27px;border:1px solid var(--line2);border-radius:6px;padding:0 7px;
+  font-size:11.5px;color:var(--text);background:#fff;outline:none}
+.vmrow button{height:27px;border:1px solid var(--line2);border-radius:6px;background:#fff;color:var(--text2);
+  font-size:13px;cursor:pointer;padding:0}
+.vmrow button:hover{background:#f5f5f8}
+.vmrow .vmdel:hover{background:#ffefef;color:var(--red);border-color:#fecaca}
 .vkv{display:grid;grid-template-columns:70px 1fr;gap:5px 8px;font-size:11.5px}
 .vkv .k{color:var(--text3)}
 .vkv .v{word-break:break-all;color:#2e2e36}
@@ -2265,6 +3559,17 @@ body.view-collapsed #viewTab{right:0}
 .tgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(66px,1fr));gap:6px}
 .tgrid .t{border:1px solid var(--line);border-radius:6px;overflow:hidden;cursor:pointer;background:#f7f8fc}
 .tgrid .t img{width:100%;height:56px;object-fit:cover;display:block}
+/* 回收站卡片 */
+.trashgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;
+  max-height:340px;overflow-y:auto;padding:2px}
+.trashcard{border:1px solid var(--line2);border-radius:9px;overflow:hidden;cursor:pointer;background:#fafbfe;position:relative}
+.trashcard .tc-box{height:70px;display:flex;align-items:center;justify-content:center;font-size:26px;color:#9aa0b4;background:#f2f3f8}
+.trashcard .tc-nm{font-size:11.5px;padding:5px 6px;line-height:1.4;word-break:break-all;overflow-wrap:anywhere;
+  min-height:34px}
+.trashcard .tc-sz{font-size:10px;color:var(--text3);padding:0 6px 5px}
+.trashcard.sel{border-color:var(--accent);background:#eef3ff}
+.trashcard .tc-x{position:absolute;top:4px;right:4px;width:18px;height:18px;border:none;border-radius:5px;
+  background:rgba(255,255,255,.9);color:var(--red);font-size:11px;cursor:pointer;line-height:1}
 
 .mask{position:fixed;inset:0;background:rgba(12,14,22,.5);display:none;align-items:center;justify-content:center;z-index:200}
 .mask.on{display:flex}
@@ -2277,17 +3582,60 @@ body.view-collapsed #viewTab{right:0}
 .rootrow{display:flex;gap:6px;margin-bottom:7px;align-items:center}
 .rootrow input{flex:1;margin:0}
 .rootrow select{height:32px;border:1px solid var(--line2);border-radius:7px;padding:0 6px;font-size:12.5px;background:#fff;color:var(--text);outline:none}
-.setwrap{display:flex;gap:14px;min-height:300px}
-.setnav{width:104px;flex:none;display:flex;flex-direction:column;gap:4px}
+/* 标签面板：照 G:\MyVedios 的标签管理样式（灰底标签 + 虚线「＋ 添加标签」） */
+.tagpanel{position:fixed;z-index:205;width:320px;max-width:92vw;
+  background:rgba(255,255,255,.96);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border:1px solid var(--line);border-radius:11px;box-shadow:0 12px 32px rgba(0,0,0,.16);padding:12px;
+  display:flex;flex-direction:column;gap:9px}
+.tagpanel.hide{display:none}
+.tagpanel h4{font-size:12px;color:var(--text3);font-weight:600;margin:0;letter-spacing:.3px}
+.tagpanel .tgrow{display:flex;flex-wrap:wrap;gap:8px;max-height:168px;overflow-y:auto}
+.tagpanel .tgitem{font-size:13px;padding:5px 10px;border-radius:7px;background:#f2f3f7;color:#4a4a54;
+  display:inline-flex;gap:7px;align-items:center}
+.tagpanel .tgitem .x{cursor:pointer;opacity:.45;font-weight:700;border:none;background:transparent;
+  color:inherit;padding:0;font-size:13px;line-height:1;font-family:inherit}
+.tagpanel .tgitem .x:hover{opacity:1;color:var(--red)}
+.tagpanel .tgadd{font-size:13px;padding:5px 11px;border-radius:7px;border:1px dashed var(--line2);
+  color:var(--text3);cursor:pointer;background:#fff}
+.tagpanel .tgadd:hover{border-color:var(--accent);color:var(--accent)}
+.tagpanel .tp-all{display:flex;flex-wrap:wrap;gap:7px;max-height:150px;overflow-y:auto}
+.tagpanel .tagbtn{font-size:12.5px;padding:5px 11px;border-radius:7px;background:#f2f3f7;color:#5e5e68;
+  cursor:pointer;user-select:none;border:none;font-family:inherit}
+.tagpanel .tagbtn:hover{background:#e8e9ef}
+.tagpanel .tagbtn.on{background:var(--accent);color:#fff}
+.tagpanel .tp-input{border:none;outline:none;flex:1;min-width:110px;font-size:13px;padding:4px;background:transparent}
+.tagpanel input.tgadd{border:1px dashed var(--line2);border-radius:7px;padding:5px 11px;font-size:13px;
+  color:var(--text);background:#fff;width:130px;flex:0 0 auto;outline:none}
+.tagpanel input.tgadd:focus{border-color:var(--accent)}
+.tagpanel .tg-edit{border:none;outline:none;background:transparent;font:inherit;color:inherit;
+  width:88px;min-width:60px;padding:0}
+.tagpanel .tgitem.common{background:#eef3ff;color:var(--accent)}
+.tagpanel .tgitem .tpcount{font-size:10.5px;color:var(--text3);font-weight:600}
+.tagpanel .tgitem.common .tpcount{color:var(--accent)}
+.tagpanel .tagbtn.part{border:1px dashed var(--line2);background:#fff;color:var(--text2)}
+.tagpanel .tpfoot{display:flex;align-items:center;justify-content:flex-end;gap:8px;
+  border-top:1px solid var(--line);padding-top:9px}
+.tagpanel .tpfoot .fbtn{height:28px;padding:0 11px;font-size:12.5px;box-sizing:border-box;line-height:1}
+/* 设置面板：固定尺寸，左右各自滚动，切标签不再变高变宽 */
+.setwrap{display:flex;gap:14px;height:360px}
+.setnav{width:104px;flex:none;display:flex;flex-direction:column;gap:4px;overflow-y:auto}
 .settab{text-align:left;padding:7px 10px;border-radius:7px;border:1px solid transparent;background:none;
   font-size:12.5px;color:var(--text2);cursor:pointer;font-family:inherit}
 .settab:hover{background:#f5f5f8}
 .settab.on{background:#eef3ff;color:var(--accent);border-color:#d9e2ff;font-weight:600}
-.setbody{flex:1;min-width:0}
+.setbody{flex:1;min-width:0;overflow-y:auto;overflow-x:hidden;padding-right:4px}
 .setbody label{display:block;font-size:12px;color:var(--text3);margin:0 0 6px}
 .setsec.hide{display:none}
 .setbody input{width:100%;height:34px;border:1px solid var(--line2);border-radius:8px;
   padding:0 10px;font-size:13px;outline:none;margin-bottom:8px}
+/* 分段开关（开启 / 禁用）：照 Comfyui-EzFlex-Presets 的 segSwitch */
+.sw{display:inline-flex;align-items:center;gap:10px;cursor:pointer;user-select:none;font-size:12px;color:var(--text)}
+.sw input{display:none}
+.sw .seg{flex:0 0 auto;display:flex;background:#f1f2f6;border-radius:9px;padding:2px}
+.sw .seg em{font-style:normal;font-size:11px;font-weight:600;padding:4px 14px;border-radius:7px;
+  color:var(--text3);cursor:pointer;transition:background .15s,color .15s}
+.sw .seg em.on.active{background:#e7f7ee;color:#1f7a4d}
+.sw .seg em.off.active{background:#fdecec;color:var(--red)}
 /* 行内控件统一高度、基线对齐（input / select / 按钮以前各是 34 / 32 / 26，看着是错位的） */
 .setbody .rootrow{align-items:center}
 .setbody .rootrow input,
@@ -2327,10 +3675,34 @@ body.view-collapsed #viewTab{right:0}
 <body>
 
 <aside id="sidebar">
-  <div class="brand" id="brandBtn" title="点一下刷新（外部改动了文件夹后用它重新扫描）"><img class="logo" src="/icon.png" alt=""><h1>Zip2mmd</h1></div>
-  <div class="srow"><input class="sinput grow" id="q" placeholder="搜索压缩包…" autocomplete="off">
+ <div class="side-fixed">
+  <div class="brand" id="brandBtn" title="Zip2mmd v__APP_VERSION__ · 点一下刷新"><img class="logo" src="/icon.png" alt=""><h1>Zip2mmd</h1></div>
+  <div class="srow">
+    <div class="sbox" id="sbox">
+      <input class="sinput" id="q" placeholder="搜索压缩包…" autocomplete="off">
+      <button class="histArrow" id="histArrow" title="搜索历史" tabindex="-1">▾</button>
+      <div class="histPanel hide" id="histPanel"></div>
+    </div>
     <button class="fbtn" id="filterBtn" title="筛选">筛选</button></div>
   <div class="fpanel hide" id="filterPanel">
+    <div class="fgroup">
+      <div class="flabel">类型</div>
+      <div class="frow">
+        <button class="fbtn on" data-fkind="all">全部</button>
+        <button class="fbtn" data-fkind="archive">压缩包</button>
+        <button class="fbtn" data-fkind="model">模型</button>
+        <button class="fbtn" data-fkind="motion">动作</button>
+        <button class="fbtn" data-fkind="image">图片</button>
+        <button class="fbtn" data-fkind="audio">音频</button>
+        <button class="fbtn" data-fkind="other">其他</button>
+      </div>
+    </div>
+    <div class="fgroup">
+      <div class="flabel">范围</div>
+      <div class="frow">
+        <button class="fbtn" id="innerBtn" title="搜索压缩包内的文件名">含包内</button>
+      </div>
+    </div>
     <div class="fgroup">
       <div class="flabel">加密</div>
       <div class="frow">
@@ -2347,12 +3719,31 @@ body.view-collapsed #viewTab{right:0}
         <button class="fbtn" data-fcov="none">无</button>
       </div>
     </div>
+    <div class="fgroup">
+      <div class="flabel">是否重复</div>
+      <div class="frow">
+        <button class="fbtn" id="dupBtn" title="只看重复资源，默认关闭">仅看重复</button>
+      </div>
+      <div class="frow" id="dupModeRow">
+        <button class="fbtn on" data-dupmode="name">同名</button>
+        <button class="fbtn" data-dupmode="size">大小+时间</button>
+        <button class="fbtn" data-dupmode="md5">MD5</button>
+      </div>
+    </div>
+    <div class="fgroup" id="tagGroup" style="display:none">
+      <div class="flabel">标签</div>
+      <div class="frow" id="tagFilter"></div>
+    </div>
   </div>
-  <div id="nav"></div>
+  <div id="navHead"></div>
+ </div>
+ <div class="side-scroll"><div id="nav"></div></div>
+ <div class="side-fixed side-foot">
   <div class="divider"></div>
   <div class="sitem" id="trashBtn">工具回收站</div>
   <div class="sitem" id="settingsBtn">设置</div>
   <div class="statline" id="statline"></div>
+ </div>
 </aside>
 <div class="vsplit side" id="splitSide" title="拖动调整左侧栏宽度"></div>
 <div class="edge-tab" id="sideTab" title="收起 / 展开左侧栏">‹</div>
@@ -2361,35 +3752,42 @@ body.view-collapsed #viewTab{right:0}
   <div class="toolbar">
     <div class="crumb" id="crumb"></div>
     <span style="flex:1"></span>
+    <span class="hint" id="secSummary" style="display:none"></span>
+  </div>
+  <div class="toolbar toolbar2" id="ctrlBar">
+    <button class="fbtn" id="secBtn" title="选择要显示的分栏：点击切换，Ctrl 加选，Shift 首尾多选">分栏 <span id="secLbl" style="color:var(--text3)">全部</span></button>
+    <select class="fbtn" id="sortSel" title="排序方式" style="padding:4px 6px">
+      <option value="default">默认排序</option>
+      <option value="name">名称 A→Z</option>
+      <option value="nameDesc">名称 Z→A</option>
+      <option value="size">大小（大到小）</option>
+      <option value="mtime">修改时间（新到旧）</option>
+    </select>
+    <button class="fbtn" id="viewBtn">列表</button>
     <button class="fbtn" id="foldAll">折叠全部</button>
     <button class="fbtn" id="cmodeBtn" title="切换：堆叠分栏 / 左右铺开">左右铺开</button>
-    <button class="fbtn" id="viewBtn">列表</button>
     <button class="fbtn on" id="toggleViewer">视口</button>
   </div>
-  <div class="toolbar toolbar2" id="filterBar">
-    <span class="hint" style="flex:none">分栏</span>
-    <button class="fbtn on" data-filter="all">全部</button>
-    <button class="fbtn" data-filter="model">模型</button>
-    <button class="fbtn" data-filter="image">图片</button>
-    <button class="fbtn" data-filter="texture">贴图</button>
-    <button class="fbtn" data-filter="archive">压缩包</button>
-    <button class="fbtn" data-filter="motion">动作</button>
-    <button class="fbtn" data-filter="doc">文档</button>
-    <button class="fbtn" data-filter="other">其他</button>
-    <span class="hint" id="secSummary" style="margin-left:4px"></span>
+  <div class="fpanel hide" id="secPanel">
+    <div class="frow" id="secList"></div>
   </div>
   <div class="batchbar hide" id="batchBar">
-    <span class="bcount" id="batchCount">已选 0</span>
-    <button class="fbtn" data-b="all">全选</button>
-    <button class="fbtn" data-b="inv">反选</button>
-    <button class="fbtn" data-b="none">清空</button>
-    <span style="flex:1"></span>
-    <button class="fbtn solid" data-b="move">移动至…</button>
-    <button class="fbtn" data-b="cover">生成预览图</button>
-    <button class="fbtn" data-b="delcover">删除预览图</button>
-    <button class="fbtn" data-b="exit">退出批量</button>
+    <div class="brow">
+      <button class="fbtn" data-b="all">全选</button>
+      <button class="fbtn" data-b="inv">反选</button>
+      <button class="fbtn" data-b="none">清空</button>
+      <button class="fbtn" data-b="trash" style="color:var(--red)">删除</button>
+      <button class="fbtn" data-b="exit">退出批量</button>
+      <span class="bcount" id="batchCount">已选 0</span>
+    </div>
+  </div>
+  <div class="taskbar hide" id="taskBar">
+    <span id="taskText"></span><span style="flex:1"></span>
+    <span class="bar"><i id="taskFill"></i></span>
+    <button class="fbtn" id="taskCancel">取消</button>
   </div>
   <div id="content"><div class="empty">从左侧选一个分组或压缩包</div></div>
+  <div class="pagerbar hide" id="pagerBar"></div>
 </section>
 <div class="vsplit view" id="splitView" title="拖动调整预览栏宽度"></div>
 
@@ -2397,6 +3795,7 @@ body.view-collapsed #viewTab{right:0}
   <div class="vhead">
     <span class="ic" id="vClose" title="收起视口">✕</span>
     <span class="vt" id="vTitle">3D 视口</span>
+    <span class="ic" id="vAxis" title="视图导航球">视角</span>
     <span class="ic" id="vShot" title="截图">截图</span>
   </div>
   <div id="canvasWrap">
@@ -2408,6 +3807,17 @@ body.view-collapsed #viewTab{right:0}
     </div>
     <div class="mtip" id="mouseTip">左键旋转 · 右键平移</div>
     <div class="vbadge" id="vBadge"></div>
+    <div class="vnavball" id="vNavBall">
+      <button data-view="front" title="正面 (+Z)">正</button>
+      <button data-view="top" title="顶面 (+Y)">顶</button>
+      <button data-view="back" title="背面 (-Z)">背</button>
+      <button data-view="left" title="左侧 (-X)">左</button>
+      <button data-view="home" title="等轴测回正">回正</button>
+      <button data-view="right" title="右侧 (+X)">右</button>
+      <button data-view="bottom" title="底面 (-Y)">底</button>
+      <button data-view="iso2" title="等轴测 (另一侧)">斜视</button>
+      <button class="home" data-view="fit" title="适应模型">适应</button>
+    </div>
     <div class="shotguide hide" id="shotGuide">
       <div class="shotbar">
         <span class="shotip">虚线内就是截图范围</span>
@@ -2415,8 +3825,19 @@ body.view-collapsed #viewTab{right:0}
         <button class="fbtn" id="shotNo">取消</button>
       </div>
     </div>
+    <div class="vmbartab" id="vmBarTab" title="收起 / 展开播放条">▾</div>
   </div>
-  <div class="vfoot" id="vFoot"></div>
+  <div class="hsplit" id="splitFoot" title="拖动调整下方面板高度"></div>
+  <div class="vfoot" id="vFootWrap">
+    <div class="footnav" id="footNav">
+      <button class="foottab on" data-foot="normal">常规</button>
+      <button class="foottab" data-foot="vm">管理</button>
+    </div>
+    <div class="footpanes">
+      <div class="footpane on" id="vFoot"></div>
+      <div class="footpane" id="vmFoot"></div>
+    </div>
+  </div>
 </section>
 <div class="edge-tab" id="viewTab" title="收起 / 展开预览栏">›</div>
 
@@ -2434,6 +3855,7 @@ body.view-collapsed #viewTab{right:0}
 <script src="/vendor/OrbitControls.js"></script>
 <script src="/vendor/mmd-parser.min.js"></script>
 <script src="/vendor/MMDLoader.js"></script>
+<script src="/vendor/CCDIKSolver.js"></script>
 <script src="/vendor/GLTFLoader.js"></script>
 <script src="/vendor/fflate.min.js"></script>
 <script src="/vendor/NURBSUtils.js"></script>
@@ -2447,15 +3869,101 @@ const S = {
   meta:null, archives:[], files:[], cur:null, curName:'',
   filter:'all', viewMode:'grid', sel:null, pwd:'',
   folded:{}, foldSec:{}, lbList:[], lbIdx:0,
-  light:1, autoExpo:true, lightColor:'#ffffff', openers:{}, passwords:[], tools:{}, faceTex:'',
+  light:1, autoExpo:true, lightColor:'#ffffff', openers:{}, passwords:[], tools:{}, faceTex:'', sort:'default', page:1, pageSize:60, tags:{}, fltTags:new Set(), fltTagAnchor:null, favs:null, secs:null, secAnchor:null,
   contentMode:'stack', activeCat:'model', mouseMode:'default', rightRotate:false,
   coverNames:['ZipPreview.png'], coverFolder:'ZipPreview', coverVer:0,
-  pwTried:false
+  pwTried:false, searchGlobal:false, selBeforeSearch:null, coverWarming:false, kb:null,
+  clip:{items:[], mode:''}, innerMode:false, innerHits:[],
+  dup:null, dupModes:new Set(['name']), qHistory:[], taskCancel:false
 };
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+/* 搜索命中高亮：先按原字符串切段再逐段转义，避免 XSS */
+function highlightQ(s, q){
+  const str = String(s||''), needle = String(q||'');
+  if(!needle) return esc(str);
+  const low = str.toLowerCase(), nlow = needle.toLowerCase();
+  let out = '', i = 0, hit;
+  while((hit = low.indexOf(nlow, i)) >= 0){
+    out += esc(str.slice(i, hit)) + '<mark>' + esc(str.slice(hit, hit + needle.length)) + '</mark>';
+    i = hit + needle.length;
+  }
+  return out + esc(str.slice(i));
+}
+function archiveKind(a){
+  const e = String((a && a.ext) || '').toLowerCase();
+  if(['.pmx','.pmd','.glb','.gltf','.fbx','.obj'].includes(e)) return 'model';
+  if(['.vmd','.vpd'].includes(e)) return 'motion';
+  if(['.mp3','.wav','.ogg','.m4a','.aac','.flac','.opus'].includes(e)) return 'audio';
+  if(['.png','.jpg','.jpeg','.webp','.gif','.bmp','.dds','.tga'].includes(e)) return 'image';
+  if(['.zip','.7z','.rar','.rar4','.rar5','.001','.exe','.sfx'].includes(e)) return 'archive';
+  return 'other';
+}
+/* 通用多选点击：普通=单选/取消，Ctrl=加选/减选，Shift=首尾区间。
+   keys 是稳定顺序（不含"全部"哨兵），返回新的锚点。shift 不改锚点。 */
+function multiPick(ev, key, keys, cur, anchor){
+  if(ev.shiftKey && anchor!=null && keys.includes(anchor) && keys.includes(key)){
+    const a=keys.indexOf(anchor), c=keys.indexOf(key);
+    for(let i=Math.min(a,c);i<=Math.max(a,c);i++) cur.add(keys[i]);
+    return anchor;
+  }
+  if(ev.ctrlKey || ev.metaKey){
+    if(cur.has(key)) cur.delete(key); else cur.add(key);
+    return key;
+  }
+  if(cur.size===1 && cur.has(key)) cur.clear();
+  else { cur.clear(); cur.add(key); }
+  return key;
+}
+function renderQHistory(){
+  const p = $('#histPanel'); if(!p) return;
+  const list = S.qHistory||[];
+  p.innerHTML = list.length
+    ? list.map(x=>`<div class="hi" data-hist="${esc(x)}"><span class="t">${esc(x)}</span><span class="x" data-hdel="${esc(x)}" title="删除">✕</span></div>`).join('')
+    : '<div class="hempty">没有搜索历史</div>';
+}
+function showHist(anchor){
+  const p = $('#histPanel'); if(!p) return;
+  renderQHistory();
+  p.classList.remove('hide');
+  const r = (anchor||$('#q')).getBoundingClientRect();
+  const w = p.getBoundingClientRect().width;
+  let left = r.left;
+  if(left + w > window.innerWidth - 8) left = Math.max(8, r.right - w);
+  p.style.left = Math.max(8, left) + 'px';
+  p.style.top = (r.bottom + 6) + 'px';
+}
+function hideHist(){ const p=$('#histPanel'); if(p) p.classList.add('hide'); }
+function loadQHistory(){
+  try{ S.qHistory = JSON.parse(localStorage.getItem('zt_qhistory') || '[]') || []; }catch(e){ S.qHistory = []; }
+  if(!Array.isArray(S.qHistory)) S.qHistory = [];
+  renderQHistory();
+}
+function pushQHistory(text){
+  text = String(text||'').trim(); if(!text) return;
+  S.qHistory = [text].concat((S.qHistory||[]).filter(x=>x && x !== text)).slice(0,12);
+  try{ localStorage.setItem('zt_qhistory', JSON.stringify(S.qHistory)); }catch(e){}
+  renderQHistory();
+}
 const enc = encodeURIComponent;
+
+/* 本地接口令牌：写操作通过 X-ZT 请求头传递，避免 token 出现在 URL 里 */
+const API_TOKEN = '__API_TOKEN__';
+(function(){
+  const raw = window.fetch.bind(window);
+  window.fetch = function(u, o){
+    try{
+      if(typeof u === 'string' && u.indexOf('/api/') === 0){
+        o = o || {};
+        const h = new Headers(o.headers || {});
+        if(!h.has('X-ZT')) h.set('X-ZT', API_TOKEN);
+        o = Object.assign({}, o, {headers:h});
+      }
+    }catch(e){}
+    return raw(u, o);
+  };
+})();
 const coverURL = p => `/api/cover?path=${enc(p)}&password=${enc(S.pwd)}&v=${S.coverVer}`;
 const coverBox = p => `<img class="cover" loading="lazy" src="${coverURL(p)}" onerror="this.classList.add('hide')">`;
 const IMG = new Set(['.png','.jpg','.jpeg','.webp','.bmp','.gif','.tga','.dds']);
@@ -2470,6 +3978,14 @@ window.addEventListener('error', ev=>{
 });
 
 /* ===================== 侧栏 ===================== */
+/* 增量操作已经拿到最新 meta 时用它更新界面，避免再 loadMeta() 全量重扫 */
+function applyMeta(m){
+  if(!m) return false;
+  S.meta = m; S.archives = m.archives || []; S.coverMap = null;
+  renderStat(); renderNav(); renderArchiveList();
+  return true;
+}
+
 async function loadMeta(){
   const r = await fetch('/api/meta');
   S.meta = await r.json();
@@ -2484,9 +4000,21 @@ async function loadMeta(){
     S.tools = {seven_zip: st.seven_zip || '', unrar: st.unrar || '',
                text_editor: st.text_editor || ''};
   }catch(e){}
+  try{ const tg = await fetch('/api/tags').then(r=>r.json()); S.tags = tg.tags || {}; }catch(e){}
+  try{ const fv = await fetch('/api/favs').then(r=>r.json()); S.favs = new Set(fv.favs || []); }catch(e){ S.favs = S.favs || new Set(); }
   try{ S.rightRotate = localStorage.getItem('zipview.rightRotate') === '1'; }catch(e){}
   try{ S.autoExpo = localStorage.getItem('zipview.autoExpo') !== '0'; }catch(e){}
   try{ S.lightColor = localStorage.getItem('zipview.lightColor') || '#ffffff'; }catch(e){}
+  // 目录树折叠状态：首次（无记录）默认全收起
+  try{
+    const raw = localStorage.getItem('zip2mmd.folded');
+    S.folded = raw ? (JSON.parse(raw) || {}) : {};
+  }catch(e){ S.folded = {}; }
+  if(!localStorage.getItem('zip2mmd.folded')){
+    S.folded = {};
+    for(const k of navFoldKeys()) S.folded[k] = true;   // 默认收起
+    saveFolded();
+  }
   renderStat();
   if(S.meta.encKnown < S.meta.total) setTimeout(pollEncryption, 300);
 }
@@ -2522,21 +4050,58 @@ function renderStat(){
     `${m.roots.length} 个监控目录`;
 }
 
+function archiveHitQ(a, q){
+  if(!q) return false;
+  return String(a.name||'').toLowerCase().includes(q) || String(a.rel||'').toLowerCase().includes(q);
+}
+function qMatchedGroups(q){
+  const set = new Set();
+  if(!q) return set;
+  for(const a of (S.archives || [])){
+    if(!archiveHitQ(a, q)) continue;
+    let cur = '';
+    for(const part of String(a.dir_rel||'').split('/').filter(Boolean)){
+      cur = cur ? cur + '/' + part : part;
+      set.add(cur);
+    }
+  }
+  return set;
+}
+function locateSearchSelection(q){
+  const a = (S.archives || []).find(x=>archiveHitQ(x, q));
+  if(!a) return;
+  if(a.dir_rel) S.sel = {type:'group', root:a.root, group:a.dir_rel};
+  else S.sel = {type:'root', root:a.root};
+}
+function endGlobalSearch(){
+  if(S.searchGlobal && S.selBeforeSearch) S.sel = S.selBeforeSearch;
+  S.selBeforeSearch = null;
+  S.searchGlobal = false;
+}
 function renderNav(){
   const q = $('#q').value.trim().toLowerCase();
+  const matchGroups = q ? qMatchedGroups(q) : null;
   const m = S.meta;
-  let h = '';
-  // 顶部的「全部」：固定入口，显示所有监控目录里的压缩包总数
-  h += `<div class="entry ${S.sel && S.sel.type==='all' ? 'on':''}" data-nav="all">
+  // 固定头部：全部 / 收藏 / 目录分组标题+折叠展开图标（不随目录树滚动）
+  let head = '';
+  head += `<div class="entry ${S.sel && S.sel.type==='all' ? 'on':''}" data-nav="all">
           <span class="t">全部</span><span class="n">${m.total}</span></div>`;
-  h += `<div class="slabel">目录分组</div>`;
+  head += `<div class="entry ${S.sel && S.sel.type==='fav' ? 'on':''}" data-nav="fav">
+          <span class="t">收藏</span><span class="n">${(S.favs || []).size || 0}</span></div>`;
+  head += `<div class="slabel navhead"><span>目录分组</span><span class="navtools">
+          <button class="navtool" data-navtool="fold" title="全部折叠">${NAV_ICONS.foldAll}</button>
+          <button class="navtool" data-navtool="unfold" title="全部展开">${NAV_ICONS.unfoldAll}</button>
+        </span></div>`;
+  $('#navHead').innerHTML = head;
 
+  let h = '';
   for(const root of m.roots){
     const rid = 'r:' + root.path;
-    const folded = !!S.folded[rid];
+    // 搜索时强制展开相关层级，否则搜到的结果被折叠藏住
+    const folded = q ? false : navFolded(rid);
     const on = S.sel && S.sel.type==='root' && S.sel.root===root.path;
-    h += `<div class="entry ${on?'on':''} ${folded?'folded':''}" data-nav="root" data-root="${esc(root.path)}">
-            <span class="chev">▼</span>
+    h += `<div class="entry ${on?'on':''} ${folded?'folded':''}" data-nav="root" data-root="${esc(root.path)}" data-fold="${esc(rid)}">
+            <span class="chev" data-fold="${esc(rid)}">▾</span>
             <span class="t" title="${esc(root.path)}">${esc(shortPath(root.path))}</span>
             <span class="n">${root.count}</span></div>`;
     if(!root.exists){
@@ -2544,31 +4109,41 @@ function renderNav(){
       continue;
     }
     if(folded) continue;
-    h += navTree(root.groups || [], root.path, 0, q);
+    h += navTree(root.groups || [], root.path, 0, q, matchGroups);
   }
   $('#nav').innerHTML = h;
 
-  $$('#nav [data-nav]').forEach(el=>{
+  // 工具条：全部折叠 / 全部展开（在固定头部）
+  $$('#navHead [data-navtool]').forEach(b=>{
+    b.onclick = ev=>{ ev.stopPropagation(); navSetAllFolded(b.dataset.navtool === 'fold'); };
+  });
+  // 固定头部的「全部 / 收藏」入口 + 滚动区里的树条目
+  $$('#navHead [data-nav], #nav [data-nav]').forEach(el=>{
     el.onclick = ev=>{
       const kind = el.dataset.nav;
-      if(kind==='root'){
-        const rid = 'r:' + el.dataset.root;
-        S.folded[rid] = !S.folded[rid];
-        renderNav();
+      const chev = ev.target.closest('.chev');
+      const foldKey = el.dataset.fold || null;   // root / group 都可折叠
+      // 全部 / 收藏：只切换选中
+      if(kind==='all' || kind==='fav' || kind==='enc'){
+        S.sel = {type:kind};
+        S.cur = null; S.files = []; S.page = 1;
+        saveUI(); renderNav(); renderArchiveList();
         return;
       }
-      // 点小三角 = 展开/收起这一级；点名字 = 选中
-      if(kind==='group' && ev.target.classList.contains('chev') && ev.target.textContent.trim() && el.dataset.fold){
-        S.folded[el.dataset.fold] = !S.folded[el.dataset.fold];
-        renderNav();
-        return;
+      // root / group：点整行 = 选中 + 同步切换折叠；点三角 = 仅切换折叠（不改变选中）
+      if(foldKey){
+        S.folded[foldKey] = navFolded(foldKey) ? false : true;  // 展开态→收起，收起态→展开
+        saveFolded();
       }
-      if(kind==='all') S.sel = {type:'all'};
-      else if(kind==='enc') S.sel = {type:'enc'};
-      else S.sel = {type:'group', root:el.dataset.root, group:el.dataset.group};
-      S.cur = null; S.files = [];
+      if(!chev){   // 点的是行本身（名字/数字），同时选中该目录或分组
+        S.sel = kind==='root'
+          ? {type:'root', root:el.dataset.root}
+          : {type:'group', root:el.dataset.root, group:el.dataset.group};
+        S.cur = null; S.files = []; S.page = 1;
+        saveUI();
+      }
       renderNav();
-      renderArchiveList();
+      if(!chev) renderArchiveList();
     };
     if(el.dataset.nav === 'group'){
       el.oncontextmenu = ev=>{ ev.preventDefault(); groupMenu(ev, el.dataset.root, el.dataset.group); };
@@ -2590,16 +4165,18 @@ function renderNav(){
         el.classList.remove('drop');
         if(!S.drag) return;
         const src = S.drag.path;
+        const isCopy = !!S.drag.copy;
         S.drag = null;
         const dst = navTargetDir(el);
-        if(src && dst) moveTo(src, dst);
+        if(!src || !dst) return;
+        if(isCopy) copyTo(src, dst); else moveTo(src, dst);
       });
       if(kind === 'group'){
         // 文件夹本身也能拖（移动到别的分组）
         el.setAttribute('draggable', 'true');
         el.addEventListener('dragstart', ev=>{
           const dp = navTargetDir(el);
-          S.drag = {kind:'dir', path: dp};
+          S.drag = {kind:'dir', path: dp, copy: !!(ev.ctrlKey || ev.altKey)};
           // 必须写一点 dataTransfer 数据，否则 Chrome/Edge 不会真正开始拖拽
           try{ ev.dataTransfer.setData('text/plain', dp); }catch(e){}
           try{ ev.dataTransfer.effectAllowed = 'move'; }catch(e){}
@@ -2616,23 +4193,59 @@ function shortPath(p){
   return '…\\' + parts.slice(-2).join('\\');
 }
 
+/* ---- 目录树折叠：迷你图标 + 默认收起 ---- */
+const NAV_ICONS = {
+  // 全部折叠：一个块 + 减号，表示把树收成一层
+  foldAll:   '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="8.5" width="18" height="7" rx="1.6"/><path d="M8.5 12h7"/></svg>',
+  // 全部展开：树状分支（根 + 两个子），表示展开所有层级
+  unfoldAll: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="9.5" width="6" height="5" rx="1"/><rect x="16" y="3" width="6" height="5" rx="1"/><rect x="16" y="16" width="6" height="5" rx="1"/><path d="M8 12h4.5M12.5 5.5v13M12.5 5.5h3.5M12.5 18.5h3.5"/></svg>',
+};
+/* 收集当前树里所有可折叠节点的 key（root + 各级 group），用于全部折叠/展开 */
+function navFoldKeys(){
+  const out = [];
+  const walk = (nodes, rootPath)=>{
+    for(const g of nodes || []){
+      out.push('g:' + rootPath + ':' + g.path);
+      if((g.children||[]).length) walk(g.children, rootPath);
+    }
+  };
+  for(const r of (S.meta.roots || [])){
+    out.push('r:' + r.path);
+    walk(r.groups || [], r.path);
+  }
+  return out;
+}
+function navSetAllFolded(folded){
+  const val = !!folded;
+  for(const k of navFoldKeys()) S.folded[k] = val;
+  saveFolded();
+  renderNav();
+}
+/* 默认收起：S.folded 里没有记录的 key 一律视为收起；只有显式 false 才是展开。
+   这样新增的目录/分组默认也是收起，符合"默认收起"的要求。 */
+function navFolded(key){ return S.folded[key] !== false; }
+function saveFolded(){
+  try{ localStorage.setItem('zip2mmd.folded', JSON.stringify(S.folded)); }catch(e){}
+}
+
 /* 左侧目录树：逐级渲染，子文件夹缩进显示 */
-function navTree(nodes, rootPath, depth, q){
+function navTree(nodes, rootPath, depth, q, matchGroups){
   let h = '';
   for(const g of nodes){
     const key = 'g:' + rootPath + ':' + g.path;
-    const folded = !!S.folded[key];
+    const folded = q ? false : navFolded(key);   // 搜索时展开，让命中项可见
     const gon = S.sel && S.sel.type==='group' && S.sel.root===rootPath && S.sel.group===g.path;
     const kids = g.children || [];
     if(q && !(g.name||'').toLowerCase().includes(q) && !rootPath.toLowerCase().includes(q)
-       && !kids.some(c=>(c.name||'').toLowerCase().includes(q))) continue;
-    h += `<div class="entry sub ${gon?'on':''}" style="padding-left:${8 + depth*13}px"
+       && !kids.some(c=>(c.name||'').toLowerCase().includes(q))
+       && !(matchGroups && matchGroups.has(g.path))) continue;
+    h += `<div class="entry sub ${gon?'on':''} ${folded?'folded':''}" style="padding-left:${8 + depth*13}px"
             data-nav="group" data-root="${esc(rootPath)}" data-group="${esc(g.path)}"
             data-fold="${esc(key)}">
-            <span class="chev">${kids.length ? (folded?'▸':'▾') : ''}</span>
+            <span class="chev" data-fold="${esc(key)}">${kids.length ? '▾' : ''}</span>
             <span class="t" title="${esc(g.path)}">${esc(g.name)}</span>
             <span class="n">${g.count}</span></div>`;
-    if(!folded && kids.length) h += navTree(kids, rootPath, depth+1, q);
+    if(!folded && kids.length) h += navTree(kids, rootPath, depth+1, q, matchGroups);
   }
   return h;
 }
@@ -2642,10 +4255,37 @@ function groupMenu(ev, rootPath, group){
   const dir = rootPath + '\\' + group.replace(/\//g, '\\');
   showCtx(ev, [
     {icon:'', label:'新建子文件夹…', run:()=>askMkdirSub(dir)},
+    {icon:'', label:'重命名…', run:()=>askRename(dir)},
     {icon:'', label:'移动到…', run:()=>groupMoveTo(dir)},
+    {icon:'', label:'折叠父文件夹', run:()=>navFoldParent(rootPath, group)},
     '-',
     {icon:'', label:'打开所在文件夹', run:()=>post('/api/fs/reveal',{path:dir})},
+    {icon:'', label:'删除到回收站', danger:true, run:()=>askTrash(dir)},
   ]);
+}
+/* 折叠当前分组的上一级文件夹：子层级太多时快速回到上层。
+   顶层分组的上一级就是 root，否则是去掉末段后的 group。 */
+function navFoldParent(rootPath, group){
+  const parts = (group||'').split('/').filter(Boolean);
+  parts.pop();
+  const parentGroup = parts.join('/');
+  const key = parentGroup ? ('g:' + rootPath + ':' + parentGroup) : ('r:' + rootPath);
+  S.folded[key] = true;
+  saveFolded();
+  // 折叠后定位并选中「被折叠的这一层父文件夹」，而不是保留之前选中的文件夹
+  S.sel = parentGroup
+    ? {type:'group', root:rootPath, group:parentGroup}
+    : {type:'root', root:rootPath};
+  S.cur = null; S.files = []; S.page = 1;
+  saveUI();
+  renderNav();
+  renderArchiveList();
+  // 把父文件夹那一行滚到可视区中间，方便继续找上层
+  const row = $$('#nav [data-fold]').find(el=>el.dataset.fold === key);
+  if(row && row.scrollIntoView){
+    try{ row.scrollIntoView({block:'center', behavior:'smooth'}); }
+    catch(e){ try{ row.scrollIntoView(); }catch(e2){} }
+  }
 }
 
 function askMkdirSub(parent){
@@ -2665,7 +4305,8 @@ function askMkdirSub(parent){
       const d = await post('/api/fs/mkdir', {parent, name});
       if(d && d.error) return alert(d.error);
       closeDialog();
-      await loadMeta(); renderNav(); renderArchiveList();
+      if(!applyMeta(d && d.meta)) await loadMeta();
+      renderNav(); renderArchiveList();
       toast('已创建 ' + name);
     };
   });
@@ -2679,6 +4320,12 @@ function groupMoveTo(srcDir){
 function renderArchiveList(root){
   root = root || $('#content');
   const isMain = root.id === 'content';
+  if(isMain && S.dup && S.dup.on){
+    S.dup = null;
+    const b = $('#dupBtn'); if(b) b.classList.remove('on');
+  }
+  const qbox = $('#q');
+  if(qbox) qbox.placeholder = S.innerMode ? '搜索名称与包内文件…' : '搜索压缩包…';
   if(isMain && S.contentMode === 'split'){ renderSplit(); return; }
   if(isMain && (!S.meta || !S.meta.roots || !S.meta.roots.length)){
     root.classList.remove('split');
@@ -2689,10 +4336,18 @@ function renderArchiveList(root){
   const q = $('#q').value.trim().toLowerCase();
   let list = S.archives;
   const sel = S.sel || {type:'all'};
-  if(sel.type==='enc') list = list.filter(a=>a.encrypted===true || a.ext==='.sfx');
-  else if(sel.type==='group') list = list.filter(a=>a.root===sel.root && ((a.dir_rel||'')===sel.group || (a.dir_rel||'').startsWith(sel.group + '/')));
-  else if(sel.type==='root') list = list.filter(a=>a.root===sel.root);
-  if(q) list = list.filter(a=>a.name.toLowerCase().includes(q) || a.rel.toLowerCase().includes(q));
+  // 搜索是全局行为：命中项可能在别的目录分组里，此时不再受当前分组限制
+  if(!(S.searchGlobal && q)){
+    if(sel.type==='enc') list = list.filter(a=>a.encrypted===true || a.ext==='.sfx');
+    else if(sel.type==='group') list = list.filter(a=>a.root===sel.root && ((a.dir_rel||'')===sel.group || (a.dir_rel||'').startsWith(sel.group + '/')));
+    else if(sel.type==='fav') list = list.filter(a=>S.favs && S.favs.has(a.path));
+    else if(sel.type==='root') list = list.filter(a=>a.root===sel.root);
+  }
+  if(S.fltTags.size) list = list.filter(a=>(S.tags&&S.tags[a.path]||[]).some(t=>S.fltTags.has(t)));
+  if(S.flt && S.flt.kinds && S.flt.kinds.size){
+    list = list.filter(a=>S.flt.kinds.has(archiveKind(a)));
+  }
+  if(q) list = list.filter(a=>archiveHitQ(a, q));
 
   // 筛选面板：加密状态 / 有没有预览图
   if(S.flt){
@@ -2710,35 +4365,73 @@ function renderArchiveList(root){
   if(S.batch && S.batch.on) S.batch.order = list.map(a=>a.path);
 
   if(isMain){
-    $('#crumb').innerHTML = `<b>${esc(crumbText(sel))}</b>
+    const crumbLabel = (S.searchGlobal && q) ? `搜索：${esc(q)}` : esc(crumbText(sel));
+    $('#crumb').innerHTML = `<b>${crumbLabel}</b>
       <span style="color:var(--text3)">${list.length} 个</span>`;
     $('#secSummary').textContent = '';
     root.classList.remove('split');
   }
 
   if(!list.length){
-    root.innerHTML = '<div class="empty">这个分组下没有压缩包</div>';
+    root.innerHTML = q ? '<div class="empty">没有找到匹配的压缩包</div>' : '<div class="empty">这个分组下没有压缩包</div>';
     return;
   }
 
+  // 排序
+  const sortMode = S.sort || 'default';
+  if(sortMode !== 'default'){
+    const cmp = (a, b) => String(a).localeCompare(String(b), 'zh', {numeric:true, sensitivity:'base'});
+    list = list.slice();
+    if(sortMode === 'name')      list.sort((a,b)=>cmp(a.name, b.name));
+    else if(sortMode === 'nameDesc') list.sort((a,b)=>cmp(b.name, a.name));
+    else if(sortMode === 'size') list.sort((a,b)=>(b.raw_size||0)-(a.raw_size||0));
+    else if(sortMode === 'mtime')list.sort((a,b)=>(b.mtime||0)-(a.mtime||0));
+  }
+
+  // 分页：只画当前页（默认 60），页码/跳转/每页条数都在底部
+  const total = list.length;
+  const size = Math.max(1, Math.min(1000, S.pageSize || 60));
+  const pages = Math.max(1, Math.ceil(total / size));
+  if((S.page || 1) > pages) S.page = pages;
+  const page = Math.max(1, S.page || 1);
+  const shown = list.slice((page - 1) * size, page * size);
+
   const groups = {};
-  for(const a of list){ (groups[a.dir] = groups[a.dir] || []).push(a); }
+  for(const a of shown){ (groups[a.dir] = groups[a.dir] || []).push(a); }
 
   let h = `<div class="${S.viewMode==='rows'?'rows':''}">`;
   for(const dir of Object.keys(groups).sort()){
     h += `<div class="dirbar">${esc(dir)}</div><div class="${S.viewMode==='grid'?'grid':''}">`;
     for(const a of groups[dir]){
       h += `<div class="card ${S.batch&&S.batch.on&&S.batch.sel.has(a.path)?'sel':''}" data-archive="${esc(a.path)}" draggable="true">
-        <div class="box"><span class="ext">${a.badge}</span>${coverBox(a.path)}</div>
+        <div class="box"><span class="ext">${a.badge}</span>${coverBox(a.path)}<button class="star ${S.favs&&S.favs.has(a.path)?'on':''}" data-fav="${esc(a.path)}" title="收藏/取消收藏">★</button><span class="ctime">${fmtDate(a.mtime)}</span></div>
         <div class="info">
-          <div class="fn" title="${esc(a.name)}">${esc(a.name)}</div>
-          <div class="fs"><span class="tag ${a.ext==='.sfx'?'sfx':''}">${a.badge}</span>${a.encrypted===true?'<span class="tag enc">加密</span>':''}<span>${a.size}</span></div>
+          <div class="fn" title="${esc(a.name)}">${highlightQ(a.name, q)}</div>
+          <div class="fs"><span class="tag ${a.ext==='.sfx'?'sfx':''}">${a.badge}</span>${a.encrypted===true?'<span class="tag enc">加密</span>':''}${((S.tags&&S.tags[a.path])||[]).map(t=>`<span class="tag tg">${esc(t)}</span>`).join('')}<span>${a.size}</span></div>
         </div></div>`;
     }
     h += '</div>';
   }
   h += '</div>';
-  root.innerHTML = h;
+  // 主列表：分页条固定在底部；铺开模式的左窗格：跟着列表走
+  const toMain = (root.id === 'content');
+  if(toMain){
+    const bar = $('#pagerBar');
+    if(bar){
+      bar.innerHTML = pagerHTML(pages, page, size, total);
+      bar.classList.remove('hide');
+      bindPager(bar, pages, size,
+        p=>{ S.page = p; saveUI(); renderArchiveList(); $('#content').scrollTop = 0; },
+        n=>{ S.pageSize = n; S.page = 1; saveUI(); renderArchiveList(); $('#content').scrollTop = 0; });
+    }
+    root.innerHTML = h;
+  }else{
+    h += pagerHTML(pages, page, size, total);
+    root.innerHTML = h;
+    bindPager(root, pages, size,
+      p=>{ S.page = p; saveUI(); renderArchiveList(root); root.scrollTop = 0; },
+      n=>{ S.pageSize = n; S.page = 1; saveUI(); renderArchiveList(root); root.scrollTop = 0; });
+  }
 
   $$all(root, '[data-archive]').forEach(el=>{
     el.setAttribute('draggable', 'true');
@@ -2747,8 +4440,16 @@ function renderArchiveList(root){
       openArchive(el.dataset.archive);
     };
     el.oncontextmenu = ev=>{ ev.preventDefault(); archiveMenu(ev, el.dataset.archive); };
+    // 右上角星标：点一下收藏/取消，别触发打开压缩包
+    const st = el.querySelector('[data-fav]');
+    if(st){
+      st.onclick = ev=>{
+        ev.preventDefault(); ev.stopPropagation();
+        toggleFav(st.dataset.fav);
+      };
+    }
     el.addEventListener('dragstart', ev=>{
-      S.drag = {kind:'file', path: el.dataset.archive};
+      S.drag = {kind:'file', path: el.dataset.archive, copy: !!(ev.ctrlKey || ev.altKey)};
       el.classList.add('dragging');
       try{ ev.dataTransfer.setData('text/plain', el.dataset.archive); }catch(e){}
       try{ ev.dataTransfer.effectAllowed = 'move'; }catch(e){}
@@ -2776,20 +4477,464 @@ async function moveTo(src, dstDir){
     askOverwrite(d.name, yes=>{
       if(!yes) return;
       post('/api/fs/move', {src, dst_dir: dstDir, overwrite: true}).then(r=>{
-        if(r.error) toast(r.error); else afterMove(r);
+        if(r.error) toast(r.error); else afterMove(r, src);
       });
     });
     return;
   }
-  afterMove(d);
+  afterMove(d, src);
 }
-
-function afterMove(d){
+/* 移动成功后统一记撤销 + 收藏跟随；所有移动出口都走这里 */
+function afterMove(d, src){
+  if(!d || !d.path) return;
   if(d.meta){ S.meta = d.meta; S.archives = d.meta.archives; }
+  if(src){
+    pushUndo('move', src, d.path);
+    if(S.favs && S.favs.has(src)){
+      S.favs.delete(src); S.favs.add(d.path);
+      post('/api/favs', {favs:[...S.favs]}).catch(()=>{});
+    }
+  }
   if(S.cur && !S.archives.some(a=>a.path === S.cur)){ S.cur = null; S.files = []; }
   S.sel = {type:'all'};
   renderNav(); renderStat(); renderArchiveList();
   toast('已移动');
+}
+
+
+/* ---------- 记住上次的位置（分组 / 页 / 排序 / 每页条数） ---------- */
+function saveUI(){
+  try{ localStorage.setItem('zip2mmd.ui', JSON.stringify({
+    sel: S.sel, page: S.page, sort: S.sort, pageSize: S.pageSize
+  })); }catch(e){}
+}
+function restoreUI(){
+  try{
+    const ui = JSON.parse(localStorage.getItem('zip2mmd.ui') || 'null');
+    if(!ui) return;
+    if(ui.sort){ S.sort = ui.sort; const el = $('#sortSel'); if(el) el.value = ui.sort; }
+    if(ui.pageSize) S.pageSize = ui.pageSize;
+    if(ui.page) S.page = ui.page;
+    const s = ui.sel;
+    if(!s || !s.type) return;
+    if(s.type === 'all' || s.type === 'fav'){ S.sel = {type:s.type}; }
+    else if(s.type === 'root'){
+      if((S.meta.roots || []).some(r=>r.path === s.root)) S.sel = s;
+    }else if(s.type === 'group'){
+      const ok = (S.archives || []).some(a => a.root === s.root &&
+        ((a.dir_rel || '') === s.group || (a.dir_rel || '').startsWith(s.group + '/')));
+      if(ok) S.sel = s;
+    }
+  }catch(e){}
+}
+/* ---------- 分页组件（照 MyVedios 的样式和行为） ---------- */
+function hidePagerBar(){
+  const b = document.getElementById('pagerBar');
+  if(b){ b.classList.add('hide'); b.innerHTML = ''; }
+}
+function pagerHTML(pages, cur, size, total){
+  const W = 10;                       // 页码窗口：至少能直接点 10 个
+  let nums = [];
+  if(pages <= W + 2){
+    for(let i = 1; i <= pages; i++) nums.push(i);
+  }else{
+    let start = Math.max(1, cur - Math.floor(W / 2));
+    let end = start + W - 1;
+    if(end > pages){ end = pages; start = pages - W + 1; }
+    if(start > 1){ nums.push(1); if(start > 2) nums.push('…'); }
+    for(let i = start; i <= end; i++) nums.push(i);
+    if(end < pages){ if(end < pages - 1) nums.push('…'); nums.push(pages); }
+  }
+  const btn = (n, label, dis, on)=>`<button class="pg ${on?'on':''}" data-pg="${n}" ${dis?'disabled':''}>${label}</button>`;
+  return `<div class="pager">
+    ${btn(1, '«', cur<=1)}
+    ${btn(Math.max(1,cur-1), '‹', cur<=1)}
+    ${nums.map(n=>n==='…' ? '<span class="pg ell">…</span>' : btn(n, n, false, n===cur)).join('')}
+    ${btn(Math.min(pages,cur+1), '›', cur>=pages)}
+    ${btn(pages, '»', cur>=pages)}
+    <span class="lbl">跳至</span><input class="jump" type="number" min="1" max="${pages}" placeholder="${cur}">
+    <span class="lbl">每页</span><input class="psize" type="number" min="1" max="1000" step="1" value="${size}" title="1~1000，回车生效">
+    <span class="lbl">共 ${pages} 页 · ${total} 个</span>
+  </div>`;
+}
+function bindPager(root, pages, size, go, sizeSel){
+  const sc = root.querySelectorAll ? root : document;
+  sc.querySelectorAll('[data-pg]').forEach(b=>b.onclick = ()=>go(+b.dataset.pg));
+  const j = sc.querySelector('.jump');
+  if(j) j.onchange = ()=>go(Math.min(pages, Math.max(1, +j.value || 1)));
+  const ps = sc.querySelector('.psize');
+  if(ps){
+    const apply = ()=>{
+      let v = Math.round(+ps.value || size);
+      v = Math.max(1, Math.min(1000, v));
+      ps.value = v;
+      if(v !== size) sizeSel(v);
+    };
+    ps.onchange = apply;
+    ps.onkeydown = e=>{ if(e.key === 'Enter'){ e.preventDefault(); apply(); ps.blur(); } };
+  }
+}
+/* ---------- 标签 ---------- */
+/* 标签改动先改本地再提交，界面立刻反映；服务端确认后再用返回值对齐。
+   seq 用来丢掉过期响应，避免快速连点时旧结果把新状态覆盖回去。 */
+let _tagsSeq = 0;
+async function setTags(path, tags, silent){
+  const seq = ++_tagsSeq;
+  const next = (tags || []).slice();
+  S.tags = S.tags || {};
+  if(next.length) S.tags[path] = next; else delete S.tags[path];
+  if(!silent) renderArchiveList();
+  renderTagFilter();
+  const d = await post('/api/tags', {path, tags:next});
+  if(seq !== _tagsSeq) return d;
+  if(d && d.error){ toast(d.error); return d; }
+  if(d && d.tags) S.tags = d.tags;
+  if(!silent) renderArchiveList();
+  renderTagFilter();
+  return d;
+}
+/* 标签面板：灰底标签 + 原位输入 + 双击编辑，改动即时同步。
+   单项=管理自己的标签；批量=所有选中项一起处理：重复出现的算共有标签。 */
+let TAGPANEL_PATHS = [];
+let _tagPanelCommitSeq = 0;
+function closeTagPanel(){ const p=$('#tagPanel'); if(p) p.classList.add('hide'); TAGPANEL_PATHS=[]; }
+function allTagNames(){
+  const all=new Set();
+  for(const k in (S.tags||{})) (S.tags[k]||[]).forEach(t=>all.add(t));
+  return [...all].sort();
+}
+function openTagPanel(ev, path){
+  ev.stopPropagation();
+  const paths = [...new Set((Array.isArray(path) ? path : [path]).filter(Boolean))];
+  if(!paths.length) return;
+  TAGPANEL_PATHS = paths;
+  const total = paths.length, many = total > 1;
+  const sets = paths.map(p=>new Set((S.tags && S.tags[p]) || []));
+  let editing = false, positioned = false;
+  let p = $('#tagPanel');
+  if(!p){ p=document.createElement('div'); p.id='tagPanel'; p.className='tagpanel hide'; document.body.appendChild(p); }
+
+  const countOf = t=>sets.reduce((n,s)=>n+(s.has(t)?1:0),0);
+  const currentNames = ()=>{
+    const s=new Set(); sets.forEach(x=>x.forEach(t=>s.add(t)));
+    return [...s].sort();
+  };
+  const currentNamesSorted = ()=>{
+    const arr = currentNames();
+    if(!many) return arr;
+    return arr.sort((a,b)=>{
+      const ac = countOf(a)===total ? 1 : 0, bc = countOf(b)===total ? 1 : 0;
+      if(ac !== bc) return bc - ac;
+      const d = countOf(b) - countOf(a);
+      return d || a.localeCompare(b);
+    });
+  };
+  const seenFully = t=>many ? countOf(t)===total : countOf(t)===1;
+  const commit = ()=>{
+    const seq = ++_tagPanelCommitSeq;
+    const snapshots = sets.map(s=>[...s]);
+    S.tags = S.tags || {};
+    paths.forEach((pp,i)=>{
+      if(snapshots[i].length) S.tags[pp] = snapshots[i];
+      else delete S.tags[pp];
+    });
+    renderTagFilter();
+    renderArchiveList();
+    (async()=>{
+      for(let i=0;i<paths.length;i++){
+        if(seq !== _tagPanelCommitSeq) return;
+        const d = await post('/api/tags', {path:paths[i], tags:snapshots[i]});
+        if(seq !== _tagPanelCommitSeq) return;
+        if(d && d.error){ toast(d.error); return; }
+      }
+    })();
+  };
+  const addTag = t=>{
+    if(!t) return;
+    sets.forEach(s=>s.add(t));
+    commit();
+  };
+  const removeTag = t=>{
+    if(!t) return;
+    sets.forEach(s=>s.delete(t));
+    commit();
+  };
+  const renameTag = (oldName, newName)=>{
+    if(!newName || newName === oldName) return;
+    sets.forEach(s=>{ if(s.has(oldName)){ s.delete(oldName); s.add(newName); } });
+    commit();
+  };
+
+  const draw = (focusAdd)=>{
+    const cur = currentNamesSorted();
+    const all = allTagNames();
+    p.innerHTML = `<h4>${many ? `管理标签 · ${total} 项` : '管理标签'}</h4>
+      <div class="tgrow" id="tpEdit">
+        ${cur.map(t=>{
+          const cnt = countOf(t), common = many && cnt === total;
+          const badge = many ? `<span class="tpcount">${common?'共有':cnt+'/'+total}</span>` : '';
+          return `<span class="tgitem ${common?'common':''}" data-t="${esc(t)}" title="双击编辑">${esc(t)}${badge}<button class="x" data-x="${esc(t)}" title="移除">×</button></span>`;
+        }).join('')}
+        ${editing
+          ? `<input class="tgadd tp-input" id="tpNew" placeholder="输入标签…" spellcheck="false">`
+          : `<span class="tgadd" id="tpAdd">＋ 添加标签</span>`}
+      </div>
+      <h4 style="margin-top:2px">快速添加</h4>
+      <div class="tp-all" id="tpAll">
+        ${all.length ? all.map(t=>{
+          const cnt = countOf(t), common = many && cnt === total;
+          const cls = common ? 'on' : (cnt ? 'part' : '');
+          const tip = common ? '已在全部选中项' : '批量添加到选中项';
+          return `<button class="tagbtn ${cls}" data-quick="${esc(t)}" title="${tip}">${esc(t)}</button>`;
+        }).join('') : '<span style="font-size:11.5px;color:var(--text3)">还没有已存在的标签</span>'}
+      </div>
+      <div class="tpfoot"><button class="fbtn" id="tpClear">${many?'清除全部':'清除标签'}</button></div>`;
+    p.classList.remove('hide');
+    if(!positioned){
+      const pw = p.getBoundingClientRect().width;
+      const ph = p.getBoundingClientRect().height;
+      let left, top;
+      if(typeof ev.clientX === 'number' && typeof ev.clientY === 'number'){
+        left = ev.clientX; top = ev.clientY + 4;
+      }else{
+        const r = (ev.currentTarget||ev.target).getBoundingClientRect();
+        left = r.left; top = r.bottom + 6;
+      }
+      if(left + pw > window.innerWidth - 8) left = Math.max(8, (typeof ev.clientX==='number'?ev.clientX:left) - pw);
+      if(top + ph > window.innerHeight - 8) top = Math.max(8, window.innerHeight - ph - 8);
+      p.style.left = Math.max(8, left) + 'px';
+      p.style.top = top + 'px';
+      positioned = true;
+    }
+    // ×：单项删自己的；批量从全部选中项一起删
+    p.querySelectorAll('[data-x]').forEach(b=>b.onclick = e2=>{
+      e2.stopPropagation();
+      removeTag(b.dataset.x);
+      draw();
+    });
+    // 双击标签原地改名：批量时只替换拥有旧标签的那些项
+    p.querySelectorAll('.tgitem').forEach(el=>el.ondblclick = e2=>{
+      if(e2.target.closest('.x')) return;
+      e2.stopPropagation();
+      const oldName = el.dataset.t;
+      el.innerHTML = `<input class="tg-edit" value="${esc(oldName)}">`;
+      const inp = el.querySelector('input');
+      inp.focus(); inp.select();
+      let done = false;
+      const finish = (save)=>{
+        if(done) return; done = true;
+        const v = inp.value.trim();
+        if(save && v && v !== oldName && !seenFully(v)) renameTag(oldName, v);
+        draw();
+      };
+      inp.onkeydown = e3=>{
+        if(e3.key === 'Enter'){ e3.preventDefault(); e3.stopPropagation(); finish(true); }
+        else if(e3.key === 'Escape'){ e3.preventDefault(); e3.stopPropagation(); finish(false); }
+      };
+      inp.onblur = ()=>finish(true);
+    });
+    // 「＋ 添加标签」：输入框就在按钮原位
+    if(!editing){
+      $('#tpAdd').onclick = e2=>{ e2.stopPropagation(); editing = true; draw(true); };
+    }else{
+      const inp = $('#tpNew');
+      const addNew = ()=>{
+        if(!document.contains(inp)) return;      // 重绘后旧输入框失焦，忽略
+        const v = inp.value.trim();
+        if(!v) return;                            // 空内容失焦时保持输入状态
+        if(seenFully(v)){ inp.value = ''; return; }
+        addTag(v);
+        editing = false;
+        draw();
+      };
+      inp.onkeydown = e2=>{
+        if(e2.key === 'Enter'){ e2.preventDefault(); e2.stopPropagation(); addNew(); }
+        else if(e2.key === 'Escape'){ e2.preventDefault(); e2.stopPropagation(); editing=false; draw(); }
+      };
+      inp.onblur = addNew;
+      if(focusAdd) setTimeout(()=>{ if(document.contains(inp)) inp.focus(); }, 0);
+    }
+    // 快速标签只做批量添加；共有/已有的不重复添加
+    p.querySelectorAll('[data-quick]').forEach(b=>b.onclick = e2=>{
+      e2.stopPropagation();
+      const t = b.dataset.quick;
+      if(seenFully(t)) return;
+      addTag(t);
+      draw();
+    });
+    $('#tpClear').onclick = e2=>{
+      e2.stopPropagation();
+      sets.forEach(s=>s.clear());
+      commit();
+      closeTagPanel();
+    };
+  };
+  draw();
+}
+document.addEventListener('click', e=>{
+  const p=$('#tagPanel');
+  // 右键菜单里的「管理标签…」点下去时面板刚显示，同一次点击冒泡到这里会立刻把它关掉
+  if(p && !p.classList.contains('hide') && !p.contains(e.target)
+     && !e.target.closest('[data-tag-panel]') && !e.target.closest('#ctx')) closeTagPanel();
+});
+
+/* 筛选面板里的标签组：只在标签集合变化时重建 DOM，其余只切 class，避免焦点被抢 */
+let _tagFilterSig = '';
+function paintTagFilter(){
+  $$('#tagFilter [data-tag]').forEach(x=>{
+    const t=x.dataset.tag;
+    x.classList.toggle('on', t ? S.fltTags.has(t) : !S.fltTags.size);
+  });
+}
+function renderTagFilter(){
+  const box = document.getElementById('tagFilter');
+  const grp = document.getElementById('tagGroup');
+  if(!box || !grp) return;
+  const all = new Set();
+  for(const k in (S.tags || {})) (S.tags[k] || []).forEach(t=>all.add(t));
+  const list = [...all].sort();
+  if(!list.length){ grp.style.display='none'; box.innerHTML=''; _tagFilterSig=''; return; }
+  grp.style.display = '';
+  const keys = ['', ...list];
+  const sig = keys.join('\u0001');
+  if(sig !== _tagFilterSig){
+    _tagFilterSig = sig;
+    box.innerHTML = keys.map(t=>
+      `<button class="fbtn tgchip" data-tag="${esc(t)}">${t ? esc(t) : '全部'}</button>`
+    ).join('');
+  }
+  paintTagFilter();
+}
+$('#tagFilter').addEventListener('click', ev=>{
+  const b = ev.target.closest('[data-tag]'); if(!b) return;
+  ev.stopPropagation();
+  const t = b.dataset.tag;
+  const keys = $$('#tagFilter [data-tag]').map(x=>x.dataset.tag).filter(Boolean);
+  if(!t){ S.fltTags.clear(); S.fltTagAnchor = null; }
+  else S.fltTagAnchor = multiPick(ev, t, keys, S.fltTags, S.fltTagAnchor);
+  S.page = 1;
+  paintTagFilter();
+  renderArchiveList();
+});
+
+/* ---------- 剪贴板：Ctrl+C / Ctrl+X / Ctrl+V ---------- */
+function copyRecord(d){
+  if(d && d.path) pushUndo('copy', d.path, d.path);
+  if(d && d.meta){ S.meta = d.meta; S.archives = d.meta.archives; }
+}
+function clipTake(mode){
+  let items = [];
+  if(S.batch && S.batch.on && S.batch.sel.size){
+    items = [...S.batch.sel];
+  }else{
+    const k = kbPath();
+    if(k && !k.isFile) items = [k.path];
+    else if(S.cur && S.archives.some(a=>a.path===S.cur && a.is_loose)) items = [S.cur];
+  }
+  if(!items.length) return toast(mode==='cut'?'先选要剪切的文件':'先选要复制的文件');
+  S.clip = {items, mode};
+  toast((mode==='cut'?'已剪切 ':'已复制 ')+items.length+' 项');
+}
+
+/* 当前左侧选中的目录（粘贴目标）：分组优先，其次根目录 */
+function selDir(){
+  const s = S.sel;
+  if(!s) return '';
+  if(s.type==='group' && s.root) return s.root + '\\' + String(s.group||'').replace(/\//g,'\\');
+  if(s.type==='root' && s.root) return s.root;
+  return '';
+}
+
+async function clipPaste(){
+  const c = S.clip;
+  if(!c || !c.items.length) return toast('剪贴板是空的');
+  const dst = selDir();
+  if(!dst) return toast('先在左侧选一个文件夹作为目标');
+  const srcs = c.items.filter(p=>p && p !== dst && !p.startsWith(dst + '\\'));
+  if(!srcs.length) return toast('源和目标相同，不用粘贴');
+  if(c.mode==='cut'){
+    if(srcs.length>1) await doBatchMove(srcs, dst);
+    else await moveTo(srcs[0], dst);
+    S.clip = {items:[], mode:''};
+  }else{
+    let ok=0;
+    for(const src of srcs){
+      const d = await post('/api/fs/copy', {src, dst_dir:dst});
+      if(d.error){ toast(d.error); continue; }
+      if(d.conflict){
+        const yes = await new Promise(res=>askOverwrite(d.name,res));
+        if(!yes) continue;
+        const r = await post('/api/fs/copy', {src, dst_dir:dst, overwrite:true});
+        if(r.error){ toast(r.error); continue; }
+        copyRecord(r);
+      }else copyRecord(d);
+      ok++;
+    }
+    if(ok) toast('已粘贴 '+ok+' 项到 '+dst.split(/[\\/]/).pop());
+    renderNav(); renderStat(); renderArchiveList();
+  }
+}
+
+function batchCopyTo(dstDir){
+  const paths = [...S.batch.sel];
+  if(!paths.length) return toast('先选几个');
+  (async()=>{
+    let ok=0; S.taskCancel=false; taskBegin('复制', paths.length);
+    for(let i=0;i<paths.length;i++){
+      if(S.taskCancel) break;
+      const src=paths[i];
+      const d = await post('/api/fs/copy', {src, dst_dir:dstDir});
+      if(d.error){ toast(d.error); continue; }
+      if(d.conflict){
+        const yes = await new Promise(res=>askOverwrite(d.name,res));
+        if(!yes) continue;
+        const r = await post('/api/fs/copy', {src, dst_dir:dstDir, overwrite:true});
+        if(r.error){ toast(r.error); continue; }
+        copyRecord(r);
+      }else copyRecord(d);
+      ok++;
+      taskStep(i+1, paths.length, '复制');
+    }
+    taskEnd();
+    if(ok) toast('已复制 '+ok+' 项');
+    batchExit(); renderNav(); renderStat(); renderArchiveList();
+  })();
+}
+
+/* 复制（Ctrl+拖拽 / 右键「复制到…」） */
+async function copyTo(src, dstDir){
+  const d = await post('/api/fs/copy', {src, dst_dir: dstDir});
+  if(d.error) return toast(d.error);
+  if(d.conflict){
+    askOverwrite(d.name, async yes=>{
+      if(!yes) return;
+      const r = await post('/api/fs/copy', {src, dst_dir: dstDir, overwrite: true});
+      if(r.error) toast(r.error);
+      else { copyRecord(r); toast('已复制（覆盖）'); renderNav(); renderStat(); renderArchiveList(); }
+    });
+    return;
+  }
+  copyRecord(d);
+  toast('已复制到 ' + dstDir.split(/[\\/]/).pop());
+  renderNav(); renderStat(); renderArchiveList();
+}
+/* ---------- 统一撤销栈：move / rename / trash / copy ---------- */
+const UNDO_LABEL = {move:'移动', rename:'重命名', trash:'删除', copy:'复制'};
+function pushUndo(kind, src, dst){
+  S.undo = S.undo || [];
+  S.undo.push({kind, src, dst});
+  if(S.undo.length > 30) S.undo.shift();
+}
+async function undoLastMove(){
+  if(!(S.undo && S.undo.length)) return toast('没有可撤销的操作');
+  const last = S.undo[S.undo.length - 1];
+  const body = last.kind === 'copy' ? {kind:'copy', src:last.dst} : {kind:last.kind, src:last.src, dst:last.dst};
+  const d = await post('/api/fs/undo', body);
+  if(d && d.error) return toast(d.error);
+  S.undo.pop();
+  if(d && d.meta){ S.meta = d.meta; S.archives = d.meta.archives; }
+  toast('已撤销' + (UNDO_LABEL[last.kind] || '操作'));
+  renderNav(); renderStat(); renderArchiveList();
 }
 
 function askOverwrite(name, cb){
@@ -2806,6 +4951,7 @@ function askOverwrite(name, cb){
 function $$all(root, sel){ return [...root.querySelectorAll(sel)]; }
 
 function crumbText(sel){
+  if(sel.type==='fav') return '收藏';
   if(sel.type==='enc') return '已加密压缩包';
   if(sel.type==='group') return (sel.group || '(根目录)');
   if(sel.type==='root') return sel.root;
@@ -2814,13 +4960,36 @@ function crumbText(sel){
 
 async function openArchive(path){
   const a = S.archives.find(x=>x.path===path);
+  const qbox = $('#q');
+  if(qbox){ qbox.value = ''; qbox.placeholder = '搜索当前包内文件…'; }
+  endGlobalSearch();
   S.cur = path; S.curName = a ? a.name : path.split('/').pop();
+  // 散文件（模型/图片/音频/VMD 等）：没有包内结构，直接按类型打开，不进「第二层」列表
+  if(a && a.is_loose){
+    const ext = (a.ext || '').toLowerCase();
+    const imgExts = ['.png','.jpg','.jpeg','.webp','.bmp','.gif','.tga','.dds'];
+    const auExts = ['.mp3','.wav','.ogg','.m4a','.aac','.flac','.opus'];
+    const f = {path:'', name:a.name, ext, size:a.size, raw_size:a.raw_size,
+               is_3d:ext in M3D || /\.(pmx|pmd|glb|gltf|fbx|obj)$/i.test(ext),
+               is_pmx:/\.(pmx|pmd)$/i.test(ext),
+               is_image:imgExts.includes(ext), is_archive:false, encrypted:false};
+    S.files = [f];
+    S.pwTried = false;
+    if(f.is_image && ext !== '.dds'){ openLb(''); return; }
+    if(f.is_3d){ onFile(''); return; }                 // 复用模型分派（VMD 模式进槽 / 普通预览）
+    if(/\.vmd$/i.test(ext)){ vmAddMotion(f); return; }
+    if(auExts.includes(ext)){ vmAddAudio(f); return; }
+    showNeedApp(f);                                    // 文本/其它：右侧给打开入口
+    return;
+  }
   if(S.contentMode === 'split' && $('#paneRight')){
     // 铺开模式：左侧列表保持不动，只在右侧「新窗口」里显示加载态
     $('#paneRight').innerHTML = '<div class="empty"><div class="spin"></div>正在读取压缩包…</div>';
     $$all($('#paneLeft'), '[data-archive]').forEach(el=>
       el.classList.toggle('on', el.dataset.archive === path));
   }else{
+    // 堆叠模式：记下列表滚动位置，返回时回到原处
+    S.listScroll = $('#content').scrollTop || 0;
     $('#content').innerHTML = '<div class="empty"><div class="spin"></div>正在读取压缩包…</div>';
   }
   try{
@@ -2933,6 +5102,16 @@ function bindFileCards(root){
     const p = el.dataset.file;
     el.onclick = ()=>onFile(p);
     el.oncontextmenu = ev=>{ ev.preventDefault(); fileMenu(ev, p); };
+    if(/\.(pmx|pmd|vmd|mp3|wav|ogg|m4a|aac|flac|opus)$/i.test(p)){
+      el.setAttribute('draggable', 'true');
+      el.addEventListener('dragstart', ev=>{
+        const f = S.files.find(x=>x.path === p); if(!f) return;
+        S.vmDrag = vmDesc(f);
+        try{ ev.dataTransfer.setData('text/plain', p); }catch(e){}
+        try{ ev.dataTransfer.effectAllowed = 'copy'; }catch(e){}
+      });
+      el.addEventListener('dragend', ()=>{ S.vmDrag = null; });
+    }
   });
 }
 
@@ -2941,6 +5120,7 @@ function bindFileCards(root){
    左窗格保持原来的压缩包列表（可继续点选），右窗格相当于点进去后另开的新窗口，
    显示的就是原模式里那份按类型分栏的内容，两边都复用原来的渲染逻辑。 */
 function renderSplit(){
+  hidePagerBar();                 // 铺开模式的分页条在左窗格内部
   const content = $('#content');
   content.classList.add('split');
   $('#cmodeBtn').classList.add('on');
@@ -3010,35 +5190,42 @@ function renderFiles(root, inPane){
   const isMain = !inPane;
   const split = S.contentMode === 'split';
   if(isMain){
+    hidePagerBar();                 // 看文件列表时不需要分页条
     content.classList.toggle('split', split);
     $('#cmodeBtn').classList.toggle('on', split);
     $('#cmodeBtn').textContent = split ? '堆叠分栏' : '左右铺开';
     if(split){ renderSplit(); return; }
   }
 
-  const buckets = classify(S.files);
+  const qbox = $('#q');
+  if(qbox) qbox.placeholder = '搜索当前包内文件…';
+  const fq = (qbox?.value || '').trim().toLowerCase();
+  const files = fq ? S.files.filter(f=>String(f.name||'').toLowerCase().includes(fq)
+                                   || String(f.path||'').toLowerCase().includes(fq)) : S.files;
+  const buckets = classify(files);
   const active = buckets.filter(b=>b.items.length > 0);
 
   if(isMain){
     $('#crumb').innerHTML = `<span class="back" id="crumbBack">← 返回</span>
       <b title="${esc(S.curName)}">${esc(S.curName)}</b>
-      <span style="color:var(--text3)">${S.files.length} 个文件 · ${active.length} 栏</span>`;
+      <span style="color:var(--text3)">${fq ? files.length + ' / ' + S.files.length : S.files.length} 个文件 · ${active.length} 栏</span>`;
     $('#crumbBack').onclick = backToList;
     $('#secSummary').textContent = active.map(b=>`${b.name} ${b.items.length}`).join('   ·   ');
   } else {
     content.scrollTop = content.scrollTop || 0;
   }
 
-  // 灯箱始终包含包内全部可预览图片（dds 浏览器不认，排除）
-  S.lbList = S.files.filter(f=>f.is_image && f.ext!=='.dds').map(f=>f.path);
+  // 灯箱只包含当前筛选结果里的可预览图片（dds 浏览器不认，排除）
+  S.lbList = files.filter(f=>f.is_image && f.ext!=='.dds').map(f=>f.path);
 
   if(!active.length){
-    content.innerHTML = '<div class="empty">这个压缩包里没有可显示的文件</div>';
+    content.innerHTML = `<div class="empty">${fq ? '没有找到匹配的文件' : '这个压缩包里没有可显示的文件'}</div>`;
     return;
   }
 
   // ---- 堆叠：各类别上下排列 ----
-  const shown = active.filter(b => S.filter==='all' || S.filter===b.key);
+  const secSel = S.secs || new Set();
+  const shown = active.filter(b => !secSel.size || secSel.has(b.key));
   if(!shown.length){
     content.innerHTML = '<div class="empty">这个类型下没有文件<br><span style="font-size:12px">点上方「全部」看所有栏</span></div>';
     return;
@@ -3047,7 +5234,7 @@ function renderFiles(root, inPane){
   let h = '';
   for(const b of shown){
     const folded = !!S.foldSec[b.key];
-    const onlyOn = S.filter===b.key;
+    const onlyOn = secSel.has(b.key);
     h += `<div class="sec" data-sec="${b.key}">
       <div class="sechead" data-sechead="${b.key}" style="border-left:3px solid ${b.color}">
         <span class="chev">${folded?'▸':'▾'}</span>
@@ -3074,7 +5261,7 @@ function renderFiles(root, inPane){
     el.onclick = ev=>{
       ev.stopPropagation();
       const k = el.dataset.only;
-      S.filter = (S.filter===k) ? 'all' : k;
+      if(S.secs.has(k)) S.secs.delete(k); else S.secs.add(k);
       syncFilterBtns();
       isMain ? renderFiles() : renderSplit();
       (isMain ? $('#content') : content).scrollTop = 0;
@@ -3083,9 +5270,36 @@ function renderFiles(root, inPane){
 }
 
 function syncFilterBtns(){
-  $$('[data-filter]').forEach(b=>b.classList.toggle('on', b.dataset.filter===S.filter));
+  // 顶部「分栏」按钮上显示当前选择
+  const sel = S.secs || new Set();
+  const lbl = document.getElementById('secLbl');
+  if(lbl){
+    if(!sel.size) lbl.textContent = '全部';
+    else if(sel.size === 1){
+      const one = SECTIONS.find(s=>s.key === [...sel][0]);
+      lbl.textContent = one ? one.name : '1 项';
+    }
+    else lbl.textContent = sel.size + ' 项';
+  }
+  const btn = document.getElementById('secBtn');
+  if(btn) btn.classList.toggle('on', sel.size > 0);
 }
 
+/* 时间显示：2026-10-27 */
+function fmtDate(ts){
+  if(!ts) return '';
+  const d = new Date(ts * 1000);
+  if(isNaN(d.getTime())) return '';
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`;
+}
+/* 收藏切换 */
+async function toggleFav(path){
+  if(!S.favs) S.favs = new Set();
+  if(S.favs.has(path)) S.favs.delete(path); else S.favs.add(path);
+  renderNav(); renderArchiveList();
+  try{ await post('/api/favs', {favs: [...S.favs]}); }catch(e){}
+}
 function fileCard(f){
   const base = `path=${enc(S.cur)}&inner=${enc(f.path)}&password=${enc(S.pwd)}`;
   let box;
@@ -3103,7 +5317,7 @@ function fileCard(f){
   return `<div class="card" data-file="${esc(f.path)}">
     ${box}
     <div class="info">
-      <div class="fn" title="${esc(f.name)}">${esc(f.name)}</div>
+      <div class="fn" title="${esc(f.name)}">${highlightQ(f.name, ($('#q')?.value||'').trim().toLowerCase())}</div>
       <div class="fs">${tags.join('')}<span>${f.size}</span></div>
     </div></div>`;
 }
@@ -3112,12 +5326,42 @@ function onFile(path){
   const f = S.files.find(x=>x.path===path);
   if(!f) return;
   if(f.is_image && f.ext!=='.dds') return openLb(path);
-  if(f.is_3d) return loadModel(path);
+  // 点击模型：VMD 管理模式下替换第一槽（保留动作/镜头/其他行）；否则普通预览
+  if(f.is_3d){
+    if(typeof VM !== 'undefined' && VM.on){
+      // 点击模型：只有一个模型时替换第一槽；已有多个时替换最后一个，方便换掉末尾那个
+      const filled = VM.rows.reduce((a,r,i)=>{ if(r.modelId) a.push(i); return a; }, []);
+      return vmAddModel(f, filled.length > 1 ? filled[filled.length-1] : 0);
+    }
+    return loadModel(path);
+  }
+  if(/\.vmd$/i.test(f.name)) return vmAddMotion(f);       // 点击动作 = 只加载进池，不自动绑定
+  if(/\.(mp3|wav|ogg|m4a|aac|flac|opus)$/i.test(f.name)) return vmAddAudio(f);
+  if(f.is_archive) return openNested(f);   // 包里的压缩包：解出来再看
   return showNeedApp(f);          // 不能内嵌预览：在右侧预览区给入口，不直接下载
+}
+
+/* 打开压缩包里的压缩包：把它解到缓存里，然后当成普通压缩包浏览 */
+async function openNested(f){
+  toast('正在解开 ' + f.name + ' …');
+  const d = await post('/api/nested/open', {path:S.cur, inner:f.path, password:S.pwd});
+  if(d && d.error) return alert(d.error);
+  const r = await fetch(`/api/list?path=${enc(d.path)}&password=${enc(S.pwd)}`).then(x=>x.json());
+  if(r.need_password) return alert('这个嵌套包需要密码，先解压到本地再打开');
+  if(r.error) return alert(r.error);
+  S.parent = {cur:S.cur, curName:S.curName, files:S.files};   // 记着怎么回去
+  S.cur = d.path;
+  S.curName = f.name;
+  S.files = r.files || [];
+  S.pwTried = false;
+  syncFilterBtns();
+  renderFiles();
 }
 
 /* 不能预览的格式：在预览区显示文件名 + 「用 XXX 打开」入口 */
 function showNeedApp(f){
+  if(typeof VM !== 'undefined' && VM.on) vmExit();
+  vmSetFootTab('normal');
   if(OBJ) clearModel();
   curModelPath = S.cur;
   $('#vTitle').textContent = f.name;
@@ -3158,8 +5402,19 @@ async function openExternal(f){
 }
 
 function backToList(){
+  const qbox = $('#q');
+  if(qbox){ qbox.value = ''; qbox.placeholder = '搜索压缩包…'; }
+  if(S.parent){                      // 从嵌套压缩包返回外层
+    S.cur = S.parent.cur; S.curName = S.parent.curName; S.files = S.parent.files;
+    S.parent = null;
+    renderFiles();
+    return;
+  }
   S.cur = null; S.files = [];
   renderArchiveList();
+  // 回到点进去之前的滚动位置（等这一帧画完再设，否则会被下面的布局重置）
+  const y = S.listScroll || 0;
+  requestAnimationFrame(()=>{ $('#content').scrollTop = y; });
 }
 
 /* ===================== 3D 视口 ===================== */
@@ -3216,6 +5471,9 @@ function initGL(){
     requestAnimationFrame(loop);
     let moved = false;
     if(CTL) moved = !!CTL.update();
+    // VMD 动画推进：有动作在播时每帧更新 mixer，并强制持续渲染
+    const animating = (typeof vmTick === 'function') && vmTick(performance.now());
+    if(animating) moved = true;
     // 正面光永远从相机方向打过来
     if(LIGHTS && CAM) LIGHTS.face.position.copy(CAM.position);
     if(R && SC && CAM && (_dirty || moved)){
@@ -3376,11 +5634,11 @@ function setHint(main, sub){
                 (sub ? `<div class="sub">${sub}</div>` : '');
 }
 
-function clearModel(){
-  if(!OBJ) return;
-  SC.remove(OBJ);
+/* 释放一个模型对象占用的几何/贴图/材质（普通预览与 VMD 多模型共用） */
+function disposeObj(obj){
+  if(!obj) return;
   const seen = new Set();
-  OBJ.traverse(o=>{
+  obj.traverse(o=>{
     if(o.geometry && o.geometry.dispose){
       o.geometry.dispose();
       if(o.geometry.attributes){
@@ -3406,21 +5664,32 @@ function clearModel(){
       });
     }
   });
+}
+function clearModel(){
+  if(!OBJ) return;
+  SC.remove(OBJ);
+  disposeObj(OBJ);
   OBJ = null;
   // 曝光是按模型算的，换模型先归位，避免沿用上一个模型的曝光
   if(R && 'toneMappingExposure' in R) R.toneMappingExposure = 1.0;
 }
 
-function assetURL(baseDir, rel){
-  return `/api/asset?path=${enc(curModelPath)}&password=${enc(S.pwd)}` +
+/* 贴图请求要带上「模型自己的」压缩包路径。VMD 多模型来自不同包，不能用全局 curModelPath。 */
+function assetURL(baseDir, rel, arc, pwd){
+  const p = arc || curModelPath;
+  const pw = pwd !== undefined ? pwd : S.pwd;
+  return `/api/asset?path=${enc(p)}&password=${enc(pw)}` +
          `&base=${enc(baseDir)}&rel=${enc(rel)}`;
 }
 
 /* MMDLoader 会用 resourcePath + 贴图名 拼路径，这里给它一个可识别的标记 */
 const ASSET_TAG = '@asset/';
 
-function makeManager(baseDir){
+function makeManager(baseDir, arc, pwd){
   const mgr = new THREE.LoadingManager();
+  // 按需渲染下贴图是异步加载的；全部加载完成后必须主动重画一帧，
+  // 否则第二/第三个模型的贴图要等用户动一下相机才显示。
+  mgr.onLoad = ()=>{ if(typeof markDirty === 'function') markDirty(); };
   mgr.setURLModifier(url=>{
     if(/^(data:|blob:|https?:)/.test(url)) return url;
     if(url.startsWith('/api/model') || url.startsWith('/api/asset')) return url;
@@ -3428,7 +5697,7 @@ function makeManager(baseDir){
     if(rel.startsWith(ASSET_TAG)) rel = rel.slice(ASSET_TAG.length);
     else if(rel.startsWith('/')){ rel = rel.slice(1); if(rel.startsWith('api/')) rel = rel.slice(4); }
     if(!rel) return url;
-    return assetURL(baseDir, rel);
+    return assetURL(baseDir, rel, arc, pwd);
   });
   // 贴图统一用 TextureLoader（服务端已转 PNG），避开 TGA/DDS 的格式问题
   mgr.addHandler(/\.(png|jpg|jpeg|bmp|tga|dds|gif|webp)$/i, new THREE.TextureLoader(mgr));
@@ -3554,7 +5823,1037 @@ function standUp(obj){
 
 let _loadSeq = 0;       // 连点模型时用序号丢弃过期的加载
 
+/* ===================== VMD 动作预览：插槽式管理 =====================
+   模型/动作先进池，每行一个模型槽；每行可挂多个 VMD（主动作 + 附加动作）。 */
+let _vmId = 0;
+/* 播放中替换动作/模型：clip 是异步解析的，重绑期间若 vmTick 继续跑，
+   新 action 会以 paused=false 开始并在回调里 setTime，和逐帧 update 抢写骨骼，
+   导致姿态停在旧姿势（位置错乱）。用计数器在替换期间暂停播放，全部绑好后再 seek+续播。 */
+let _vmSwapPending = 0, _vmSwapResume = false;
+function vmSwapBegin(){
+  if(_vmSwapPending++ === 0){
+    _vmSwapResume = VM.playing;
+    if(_vmSwapResume) vmStop();
+  }
+}
+function vmSwapEnd(){
+  if(_vmSwapPending > 0) _vmSwapPending--;
+  if(_vmSwapPending === 0 && _vmSwapResume){
+    _vmSwapResume = false;
+    try{ vmSeek(VM.time); }catch(e){}
+    vmPlay();
+  }
+}
+function vmEmptyArm(){ return {id:null, mixer:null, action:null, clip:null, root:null, token:0}; }
+function vmEmptyRow(){ return {modelId:null, motions:[vmEmptyArm()]}; }
+const VM = {
+  on:false,
+  models:[], motions:[], audios:[], audioId:null, rows:[vmEmptyRow()],
+  camId:null, camMixer:null, camAction:null, camClip:null,
+  playing:false, speed:1, volume:1, loop:true, duration:0, time:0,
+  lastTick:0, seekLock:false, barCollapsed:false,
+  clipSeq:0
+};
+
+const VM_CLIP_LIMIT = 24;   // 解析后的 VMD clip 上限：超出淘汰最久未用的，避免长时间使用内存无限增长
+/* 记录 clip 使用时间（每次 attach 都算命中），供 LRU 淘汰。clip 本身没有 dispose，
+   淘汰只需从缓存移除，让 JS 对象被 GC；正在播放的 clip 不会被淘汰。 */
+function vmClipHit(motion, key, clip){
+  motion.clips[key] = clip;
+  motion._clipAt = motion._clipAt || {};
+  motion._clipAt[key] = ++VM.clipSeq;
+}
+function vmClipEvict(){
+  const used = new Set();
+  for(const r of VM.rows) for(const a of r.motions) if(a.clip) used.add(a.clip);
+  if(VM.camClip) used.add(VM.camClip);
+  const all = [];
+  for(const mo of VM.motions){
+    for(const k in mo.clips){
+      const c = mo.clips[k];
+      if(used.has(c)) continue;           // 正在用，绝不淘汰
+      all.push({mo, k, at:(mo._clipAt && mo._clipAt[k]) || 0});
+    }
+  }
+  let extra = all.length - VM_CLIP_LIMIT;
+  if(extra <= 0) return;
+  all.sort((a,b)=>a.at - b.at);
+  for(let i=0; i<extra; i++){
+    delete all[i].mo.clips[all[i].k];
+    if(all[i].mo._clipAt) delete all[i].mo._clipAt[all[i].k];
+  }
+}
+
+function vmDesc(f){
+  return {name:f.name, path:f.path, arc:f.arc || S.cur, pwd:(f.pwd !== undefined ? f.pwd : S.pwd)};
+}
+function vmURL(f){
+  return `/api/model?path=${enc(f.arc)}&inner=${enc(f.path)}&password=${enc(f.pwd)}&n=${enc(f.name)}`;
+}
+
+function vmSetFootTab(which){
+  $$('#footNav .foottab').forEach(b=>b.classList.toggle('on', b.dataset.foot === which));
+  const n = document.getElementById('vFoot'), m = document.getElementById('vmFoot');
+  if(n) n.classList.toggle('on', which === 'normal');
+  if(m) m.classList.toggle('on', which === 'vm');
+}
+function bindFootTabs(){
+  $$('#footNav .foottab').forEach(b=> b.onclick = ()=> vmSetFootTab(b.dataset.foot));
+}
+function bindVMDrop(){
+  const zones = [document.getElementById('vmFoot'), document.getElementById('canvasWrap')];
+  zones.forEach(z=>{
+    if(!z) return;
+    z.addEventListener('dragover', ev=>{
+      if(!S.vmDrag) return;
+      ev.preventDefault();
+      z.classList.add('vmdrop');
+      try{ ev.dataTransfer.dropEffect = 'copy'; }catch(e){}
+    });
+    z.addEventListener('dragleave', ()=> z.classList.remove('vmdrop'));
+    z.addEventListener('drop', ev=>{
+      if(!S.vmDrag) return;
+      ev.preventDefault();
+      z.classList.remove('vmdrop');
+      const d = S.vmDrag; S.vmDrag = null;
+      vmSetFootTab('vm');
+      if(/\.(pmx|pmd)$/i.test(d.name)) vmAddModel(d, vmAppendIndex('model'));
+      else if(/\.vmd$/i.test(d.name)){
+        /* 拖入动作 = 自动绑定到下一个模型槽（镜头 VMD 不需要模型）。
+           点击动作仍是只进池、手动下拉绑定，两者语义不同。 */
+        const cam = vmIsCameraVMD(d.name);
+        if(!cam && !VM.rows.some(r=>r.modelId)){ toast('需要先添加模型'); return; }
+        const id = vmAddMotion(d);
+        if(cam){ vmApplyCamera(id); return; }
+        let slot = vmNextMotionSlot();
+        if(!slot){
+          const i = VM.rows.findIndex(r=>r.modelId);
+          if(i < 0){ toast('需要先添加模型'); return; }
+          VM.rows[i].motions.push(vmEmptyArm());
+          slot = {i, j:VM.rows[i].motions.length-1};
+        }
+        vmApplyMotionSwitch(slot.i, slot.j, id);
+      }
+      else if(/\.(mp3|wav|ogg|m4a|aac|flac|opus)$/i.test(d.name)) vmAddAudio(d);
+    });
+  });
+}
+function vmAppendIndex(kind){
+  if(kind === 'model') return VM.rows.findIndex(r=>!r.modelId) >= 0 ? VM.rows.findIndex(r=>!r.modelId) : VM.rows.length;
+  const i = VM.rows.findIndex(r=>r.motions.some(a=>!a.id));
+  return i >= 0 ? i : VM.rows.length;
+}
+function vmNextMotionSlot(){
+  for(let i=0;i<VM.rows.length;i++){
+    const r = VM.rows[i];
+    if(!r.modelId) continue;                       // 没模型就不往这行放
+    const j = r.motions.findIndex(a=>!a.id);       // 先填主槽，再填附加槽
+    if(j >= 0) return {i, j};
+  }
+  return null;
+}
+function vmIsCameraVMD(name){ return /camera|cam|カメラ|镜头|摄像/i.test(name || ''); }
+function vmEnsureRow(i){
+  while(VM.rows.length <= i) VM.rows.push(vmEmptyRow());
+}
+
+function vmEnter(adopt=false){
+  initGL();
+  const obj = OBJ;
+  let desc = null;
+  if(adopt && obj && curModelPath && _modelInner){
+    const cur = (S.files || []).find(x=>x.path === _modelInner);
+    const nm = (cur && cur.name) || _modelInner.split('/').pop() || '模型';
+    if(/\.(pmx|pmd)$/i.test(nm)) desc = {name:nm, path:_modelInner, arc:curModelPath, pwd:S.pwd};
+  }
+  const keepMotions = VM.motions.slice();
+  const keepArms = VM.rows[0] ? VM.rows[0].motions.map(a=>a.id) : [];
+  const keepCam = VM.camId;
+  VM.on = true;
+  vmStop();
+  if(!desc && obj){ try{ clearModel(); }catch(e){} }
+  if(desc) VM.models = [];   // 当前模型交给 VM 接管，别释放它
+  vmClearAll();
+  VM.motions = keepMotions;
+  if(desc){
+    const m = Object.assign({id:++_vmId, obj}, desc);
+    VM.models.push(m);
+    vmBuildIK(obj);
+    vmEnsureRow(0);
+    VM.rows[0].modelId = m.id;
+    VM.rows[0].motions = keepArms.map(id=>Object.assign(vmEmptyArm(),{id}));
+  }
+  vmEnsureRow(0);
+  if(keepCam) VM.camId = keepCam;
+  $('#vTitle').textContent = 'VMD 动作预览';
+  $('#vBadge').classList.remove('show');
+  vmSetFootTab('vm');
+  if(desc){ vmApplyRowMotions(0); if(keepCam) vmApplyCamera(keepCam); }
+  vmRenderBar();
+  vmRenderMgr();
+}
+function vmExit(){
+  vmStop();
+  vmClearAll();
+  VM.on = false;
+  $('#vTitle').textContent = '3D 视口';
+  const hint = document.querySelector('#vHint .big'); if(hint) hint.textContent = '3D';
+  vmSetFootTab('normal');
+  vmRenderBar();
+}
+function vmClearAll(){
+  for(const r of VM.rows) vmStopRow(r);
+  for(const m of VM.models) vmRemoveModelObj(m, true);
+  if(VM.camMixer){ try{ VM.camMixer.uncacheRoot(CAM); }catch(e){} }
+  VM.models = []; VM.motions = []; VM.rows = [vmEmptyRow()];
+  VM.camId = null; VM.camMixer = null; VM.camAction = null; VM.camClip = null;
+  VM.duration = 0; VM.time = 0;
+  if(CTL) CTL.enabled = true;
+  if(CAM){ CAM.fov = 38; CAM.updateProjectionMatrix(); }
+  OBJ = null;
+}
+function vmStopArm(arm){
+  if(!arm) return;
+  arm.token = (arm.token || 0) + 1;
+  arm._loading = false;
+  try{ if(arm.action) arm.action.stop(); }catch(e){}
+  try{ if(arm.mixer && arm.root) arm.mixer.uncacheRoot(arm.root); }catch(e){}
+  arm.mixer = null; arm.action = null; arm.clip = null; arm.root = null;
+}
+function vmStopRow(row){
+  if(!row) return;
+  row.token = (row.token || 0) + 1;
+  for(const a of row.motions) vmStopArm(a);
+}
+function vmRemoveModelObj(m, keepArray){
+  if(!m) return;
+  if(m.obj && SC){ try{ SC.remove(m.obj); }catch(e){} disposeObj(m.obj); m.obj = null; }
+  if(!keepArray) VM.models = VM.models.filter(x=>x.id !== m.id);
+}
+function vmUpdateDuration(){
+  VM.duration = Math.max(0,
+    ...VM.rows.map(r=>r.motions.map(a=>a.clip ? a.clip.duration : 0)).flat(),
+    VM.camClip ? VM.camClip.duration : 0);
+  // 注意：不要在播放/替换模型时因为 clip 暂时清空就把时间轴截断到 0。
+  // 替换模型会经历「旧 clip 停掉 → 新 clip 异步加载」的空窗，此时 duration 瞬时为 0，
+  // 若在这里 clamp VM.time，就会把进度归零（表现为替换后从头播放）。
+  // 时间轴只在真正 seek 时按 duration 约束，见 vmSeek / vmTick。
+}
+function vmFindModel(d){ return VM.models.find(m=>m.path === d.path && m.arc === d.arc); }
+function vmFindMotion(d){ return VM.motions.find(m=>m.path === d.path && m.arc === d.arc); }
+/* ===== 按需资源：只有被下拉栏选中的模型才加载进显存；候选只在列表里 =====
+   - 选中但没 obj：加载，完成后绑定该模型所在行的动作
+   - 没被任何行选中但有 obj：释放几何/贴图/骨骼，回收显存
+   - 没被任何行绑定的动作 clip：清掉解析缓存
+   这样隐藏/候选模型既不占显存，也不参与每帧骨骼解算。 */
+function vmActiveIds(){
+  const models = new Set(), motions = new Set();
+  for(const r of VM.rows){
+    if(r.modelId) models.add(r.modelId);
+    for(const a of r.motions) if(a.id) motions.add(a.id);
+  }
+  if(VM.camId) motions.add(VM.camId);   // 镜头在下拉栏常驻，也算在用
+  return {models, motions};
+}
+function vmSyncActive(){
+  const used = vmActiveIds();
+  // 1) 选中的模型：加载或显示
+  for(const m of VM.models){
+    if(used.models.has(m.id)){
+      // needPose 的模型还没绑好动作，先别显示（否则会在原点以绑定姿势闪一下）
+      if(m.obj) m.obj.visible = !m.needPose;
+      else if(!m.loading){ vmLoadSelectedModel(m); }
+    }else if(m.obj){
+      // 2) 未被选中的模型：停掉绑定在它上面的动作并释放
+      for(const r of VM.rows) for(const a of r.motions){
+        if(a.root === m.obj){ vmStopArm(a); a.mixer = null; a.action = null; a.root = null; }
+      }
+      vmRemoveModelObj(m, true);   // 释放 GPU 资源，保留池里的候选记录
+    }
+  }
+  // 3) 清掉没人用的动作 clip 缓存（VMD 只在绑定时才解析，取消后释放）
+  for(const mo of VM.motions){
+    if(used.motions.has(mo.id)) continue;
+    for(const k in mo.clips) delete mo.clips[k];
+    if(mo._clipAt) mo._clipAt = {};
+  }
+}
+/* 新加载的模型先隐藏，避免动作还没绑定时以 bind pose 闪现在原点。
+   只在「动作的 clip 正在异步解析」时等待；解析失败/空 clip/镜头 VMD 都要放行，
+   否则 arm.id 被清空或 action 为空时会永久 pending → 模型消失。再加超时兜底。 */
+function vmShowModelWhenReady(m){
+  if(!m || !m.obj || !m.needPose) return;
+  const pending = VM.rows.some(r=> r.modelId === m.id &&
+    r.motions.some(a=> a._loading));      // 只有真正在解析 clip 的 arm 才挡
+  if(pending && !m._poseDeadline){ m._poseDeadline = performance.now() + 2500; }
+  if(pending && performance.now() < m._poseDeadline){ return; }
+  m.needPose = false; m._poseDeadline = 0;
+  m.obj.visible = true;
+  markDirty();
+}
+function vmLoadSelectedModel(m){
+  m.loading = true;
+  vmLoadModelObj(m, obj=>{
+    m.loading = false;
+    if(!usedModelStill(m)){ try{ disposeObj(obj); }catch(e){} return; }  // 加载期间被取消选中
+    m.obj = obj;
+    m.needPose = true;   // 等动作绑定好再显示，避免原点闪现
+    obj.visible = false;
+    // 模型到位后重绑它的动作：同样要在暂停逐帧 update 的情况下完成，避免竞态
+    const rows = [];
+    VM.rows.forEach((r,i)=>{ if(r.modelId === m.id) rows.push(i); });
+    const total = rows.reduce((n,i)=>n + VM.rows[i].motions.length, 0);
+    vmSwapBegin();
+    let left = total;
+    if(!total) vmSwapEnd();
+    else rows.forEach(i=> VM.rows[i].motions.forEach((_,j)=>
+      vmApplyArm(i, j, ()=>{ if(--left<=0) vmSwapEnd(); })));
+    vmLayoutModels();
+    vmRenderMgr(); vmRenderBar(); markDirty();
+  });
+}
+function usedModelStill(m){ return VM.rows.some(r=>r.modelId === m.id); }
+/* 多人并排：每个模型按其所在行沿 X 轴错开，避免都站在原点重叠。
+   VMD 的「センター」位移是模型局部坐标，会叠加在这个偏移上，动作轨迹不受影响。 */
+/* VMD 自带位置动画（センター / 全ての親），多人站位由动作文件本身决定。
+   不要自行改 obj.position：人为 offset 会与 VMD 的位置叠加，导致站位错乱、
+   看起来像没按动作走。保留函数仅为兼容既有调用点。 */
+function vmLayoutModels(){ /* no-op：位置完全交给 VMD */ }
+function vmUpdateVisibility(){ vmSyncActive(); }   // 兼容旧调用点
+
+/* ===== PMX 骨骼求解：IK + Grant（腰部取消骨/足D 等附加骨）=====
+   three.js 官方 MMDAnimationHelper 的 pmxAnimation 路径：按 transformationClass 排序，
+   逐根骨骼「Grant 父骨递归 → Grant 旋转 → 该骨 IK」，并用 map 传递已解算结果。
+   只做 IK 不做 Grant 时，蒙皮用的「腰キャンセル/足D/ひざD」等不会跟随 → 视觉上腰腿不动。 */
+function vmBuildIK(obj){
+  if(!obj || obj.userData.ikChecked) return;
+  obj.userData.ikChecked = true;
+  try{
+    let mesh = null;
+    obj.traverse(o=>{ if(!mesh && o.isSkinnedMesh && o.geometry && o.geometry.userData && o.geometry.userData.MMD) mesh = o; });
+    if(!mesh) return;
+    const mmd = mesh.geometry.userData.MMD;
+    obj.userData.ikMesh = mesh;
+    if(mmd.format === 'pmx' && THREE.CCDIKSolver){
+      obj.userData.ikSolver = new THREE.CCDIKSolver(mesh, mmd.iks || []);
+      const bones = mmd.bones || [];                 // PMX 规定：按 transformationClass 再 index 排序求解
+      obj.userData.pmxBones = bones;
+      obj.userData.pmxSorted = bones.map((b,i)=>({i, cls:b.transformationClass||0}))
+        .sort((a,b)=>(a.cls-b.cls)||(a.i-b.i)).map(x=>x.i);
+    }else if(mmd.iks && mmd.iks.length && THREE.CCDIKSolver){
+      // 非 PMX（如 PMD）：无 Grant/排序信息，退回普通整体 IK
+      obj.userData.ikSolver = new THREE.CCDIKSolver(mesh, mmd.iks);
+    }
+    vmCaptureBind(obj);   // 此刻骨骼是干净 bind pose，切动作时用它重置位置基准
+  }catch(e){ /* IK 不可用时退回纯骨骼动画，不影响上半身 */ }
+}
+/* 保存模型加载后干净的初始骨骼姿态（bind pose）。
+   切换动作时必须从这里开始，否则 backupBones 里是上一个动作的位置，
+   新动作 VMD 没写到的骨骼（如某些模型的 全ての親/センター）会残留旧位置 → 位置偏移。 */
+function vmCaptureBind(obj){
+  const mesh = obj && obj.userData && obj.userData.ikMesh;
+  if(!mesh) return;
+  const bones = mesh.skeleton.bones;
+  const b = new Float32Array(bones.length*7);
+  for(let i=0;i<bones.length;i++){
+    bones[i].position.toArray(b, i*7);
+    bones[i].quaternion.toArray(b, i*7+3);
+  }
+  obj.userData.bindBones = b;
+}
+function vmResetToBind(obj){
+  const bind = obj && obj.userData && obj.userData.bindBones;
+  const mesh = obj && obj.userData && obj.userData.ikMesh;
+  if(!bind || !mesh) return;
+  const bones = mesh.skeleton.bones;
+  for(let i=0;i<bones.length;i++){
+    bones[i].position.fromArray(bind, i*7);
+    bones[i].quaternion.fromArray(bind, i*7+3);
+  }
+  // 同步备份基准，避免下一帧 vmRestoreBones 又把旧动作的位置拉回来
+  const backup = obj.userData.backupBones;
+  if(backup && backup.length === bind.length) backup.set(bind);
+}
+/* 动画写入前：把骨骼恢复到上一帧保存的「纯动画」基准，避免 Grant/IK 逐帧累积 */
+function vmRestoreBones(obj){
+  const backup = obj && obj.userData && obj.userData.backupBones;
+  const mesh = obj && obj.userData && obj.userData.ikMesh;
+  if(!backup || !mesh) return;
+  const bones = mesh.skeleton.bones;
+  for(let i=0;i<bones.length;i++){
+    bones[i].position.fromArray(backup, i*7);
+    bones[i].quaternion.fromArray(backup, i*7+3);
+  }
+}
+function vmSaveBones(obj){
+  const mesh = obj && obj.userData && obj.userData.ikMesh;
+  if(!mesh) return;
+  const bones = mesh.skeleton.bones;
+  let backup = obj.userData.backupBones;
+  if(!backup){ backup = new Float32Array(bones.length*7); obj.userData.backupBones = backup; }
+  for(let i=0;i<bones.length;i++){
+    bones[i].position.toArray(backup, i*7);
+    bones[i].quaternion.toArray(backup, i*7+3);
+  }
+}
+const VM_GRANT_MAP = new Map();
+const VM_GRANT_TMP = new THREE.Quaternion();
+function vmSolveOne(obj, boneIndex){
+  const mesh = obj.userData.ikMesh;
+  const bones = mesh.skeleton.bones;
+  const bd = obj.userData.pmxBones[boneIndex];
+  const bone = bones[boneIndex];
+  if(!bone || !bd) return;
+  if(VM_GRANT_MAP.has(boneIndex)) return;
+  const store = new THREE.Quaternion().copy(bone.quaternion);   // 先占位，防 Grant 递归死循环
+  VM_GRANT_MAP.set(boneIndex, store);
+  const grant = bd.grant;                                        // Grant：附加骨按比例继承父骨旋转
+  if(grant && !grant.isLocal && grant.affectRotation){
+    const pi = grant.parentIndex;
+    if(!VM_GRANT_MAP.has(pi)) vmSolveOne(obj, pi);
+    const pq = VM_GRANT_MAP.get(pi);
+    if(pq){
+      VM_GRANT_TMP.set(0,0,0,1);
+      VM_GRANT_TMP.slerp(pq, grant.ratio);
+      bone.quaternion.multiply(VM_GRANT_TMP);
+    }
+  }
+  if(bd.ik && obj.userData.ikSolver){                             // IK：解算这条链
+    mesh.updateMatrixWorld(true);
+    obj.userData.ikSolver.updateOne(bd.ik);
+    const links = bd.ik.links || [];
+    for(let i=0;i<links.length;i++){
+      const l = links[i];
+      if(l.enabled === false) continue;
+      if(VM_GRANT_MAP.has(l.index)) VM_GRANT_MAP.get(l.index).copy(bones[l.index].quaternion);
+    }
+  }
+  store.copy(bone.quaternion);
+}
+/* 官方 _animatePMXMesh 顺序：保存基准 → 逐根 Grant+IK → 刷新世界矩阵/骨架 */
+function vmRunIK(obj){
+  const s = obj && obj.userData && obj.userData.ikSolver;
+  if(!s) return;
+  try{
+    vmSaveBones(obj);
+    if(obj.userData.pmxSorted){
+      VM_GRANT_MAP.clear();
+      const sorted = obj.userData.pmxSorted;
+      for(let i=0;i<sorted.length;i++) vmSolveOne(obj, sorted[i]);
+    }else{
+      obj.updateMatrixWorld(true);
+      s.update();
+    }
+    obj.updateMatrixWorld(true);
+    const sk = obj.userData.ikMesh && obj.userData.ikMesh.skeleton;
+    if(sk && sk.update) sk.update();
+  }catch(e){}
+}
+
+async function vmLoadModelObj(model, done){
+  const dir = (model.path || '').includes('/') ? model.path.slice(0, model.path.lastIndexOf('/')) : '';
+  // 先等这个模型自己所在包预解压完，再加载贴图；否则第二个包会读不到刚请求的贴图
+  try{ await post('/api/prefetch', {path:model.arc, dir, password:model.pwd}); }catch(e){}
+  new THREE.MMDLoader(makeManager(dir, model.arc, model.pwd)).load(vmURL(model), obj=>{
+    obj.traverse(o=>{
+      if(!o.material) return;
+      (Array.isArray(o.material)?o.material:[o.material]).forEach(m=>{
+        if(m.map){ m.map.encoding = THREE.sRGBEncoding; m.needsUpdate = true; }
+        normalizeToonMaterial(m);
+      });
+    });
+    if(SC) SC.add(obj);
+    obj.updateWorldMatrix(true, true);
+    try{ standUp(obj); }catch(e){}
+    vmBuildIK(obj);
+    done(obj);
+  }, undefined, err=>{
+    console.error(err);
+    toast('模型加载失败');
+  });
+}
+
+function vmAddModel(f, slot=0){
+  if(!initGL()) return;
+  if(!/\.(pmx|pmd)$/i.test(f.name)){ toast('VMD 模型请用 PMX / PMD'); return; }
+  if(!VM.on) vmEnter(true);
+  if(slot < 0) slot = vmAppendIndex('model');
+  vmEnsureRow(slot);
+  const d = vmDesc(f);
+  let m = vmFindModel(d);
+  if(m){ vmApplyModelSwitch(slot, m.id); return; }
+  m = Object.assign({id:++_vmId, obj:null, loading:false}, d);
+  VM.models.push(m);
+  VM.rows[slot].modelId = m.id;
+  vmRenderMgr();
+  vmSyncActive();   // 按需加载这个被选中的模型
+}
+function vmAddMotion(f){
+  if(!initGL()) return null;
+  if(!/\.vmd$/i.test(f.name)){ toast('请选 VMD 动作'); return null; }
+  const d = vmDesc(f);
+  let m = vmFindMotion(d);
+  if(!m){ m = Object.assign({id:++_vmId, clips:{}}, d); VM.motions.push(m); }
+  vmSetFootTab('vm');
+  vmRenderMgr();
+  return m.id;
+}
+
+/* 音频：只进池不自动播放；只有点播放键才随动作同步播放 */
+function vmAddAudio(f){
+  if(!/\.(mp3|wav|ogg|m4a|aac|flac|opus)$/i.test(f.name)){ toast('不支持的音频格式'); return; }
+  const d = vmDesc(f);
+  let a = VM.audios.find(x=>x.path===d.path && x.arc===d.arc);
+  if(!a){
+    const url = vmURL(d);
+    const el = new Audio(url);
+    el.loop = VM.loop; el.preload = 'auto';
+    el.volume = VM.volume; el.playbackRate = VM.speed;
+    a = Object.assign({id:++_vmId, el}, d);
+    VM.audios.push(a);
+  }
+  VM.audioId = a.id;   // 选中它，但不播放
+  // 新建的 Audio 元素 currentTime=0；若已有进度（播放中替换/暂停后重载），
+  // 元数据就绪后先对齐到当前时间轴，避免之后一点播放就从头响。
+  vmSeekAudio(VM.time);
+  vmSetFootTab('vm');
+  vmRenderMgr();
+}
+function vmApplyAudio(id){
+  // 切换音频下拉：暂停所有，只选中，不自动播放
+  for(const a of VM.audios) try{ a.el.pause(); }catch(e){}
+  VM.audioId = id || null;
+  if(!VM.playing) vmRenderMgr();
+}
+function vmDelAudio(id){
+  const a = VM.audios.find(x=>x.id===id); if(!a) return;
+  try{ a.el.pause(); a.el.src=''; }catch(e){}
+  VM.audios = VM.audios.filter(x=>x.id!==id);
+  if(VM.audioId === id) VM.audioId = VM.audios.length ? VM.audios[0].id : null;
+  vmRenderMgr();
+}
+function vmCurAudio(){ return VM.audios.find(a=>a.id===VM.audioId) || null; }
+/* 音量/速度同步到池里所有音频元素：新建时、调整控件时都要应用 */
+function vmApplyVolume(){
+  for(const a of VM.audios) try{ a.el.volume = VM.volume; }catch(e){}
+}
+function vmApplySpeed(){
+  for(const a of VM.audios) try{ a.el.playbackRate = VM.speed; }catch(e){}
+}
+
+function vmApplyModelSwitch(i, id){
+  const row = VM.rows[i]; if(!row) return;
+  // 只换模型，动作留在各自的行 —— 模型/动作分开是既有语义。
+  // （若连动作一起换，每个模型还是播自己原来的动作，视觉上就像没交换。）
+  const touched = [];
+  if(id){
+    const other = VM.rows.findIndex((r,j)=>j!==i && r.modelId === id);
+    if(other >= 0){
+      const old = row.modelId;
+      VM.rows[other].modelId = old || null;
+      touched.push(other);
+    }
+  }
+  row.modelId = id || null;
+  touched.push(i);
+  const total = touched.reduce((n,k)=>n + VM.rows[k].motions.length, 0);
+  vmSwapBegin();
+  let left = total;
+  if(!total) vmSwapEnd();
+  else touched.forEach(k=> VM.rows[k].motions.forEach((_,j)=>
+    vmApplyArm(k, j, ()=>{ if(--left<=0) vmSwapEnd(); })));
+  vmUpdateVisibility();
+  vmLayoutModels();
+  // 不在这里 fit 相机：交换行不该重置用户的视角，也不该覆盖镜头
+  vmRenderMgr();
+}
+function vmApplyRowMotions(i, done){
+  const row = VM.rows[i];
+  if(!row || !row.motions.length){ if(done) done(); return; }
+  let left = row.motions.length;
+  row.motions.forEach((_,j)=>vmApplyArm(i, j, ()=>{ if(--left<=0 && done) done(); }));
+}
+function vmApplyMotionSwitch(i, j, id){
+  if(!VM.on) vmEnter(true);
+  const row = VM.rows[i], arm = row && row.motions[j]; if(!arm) return;
+  /* 目标动作已被别的槽占用 → 交换：那个槽换成当前槽原来的动作（与模型下拉语义一致）。
+     目标动作没被占用 → 只改当前槽，正常应用。 */
+  const old = arm.id;
+  const swaps = [];
+  if(id){
+    for(let r=0;r<VM.rows.length;r++){
+      for(let k=0;k<VM.rows[r].motions.length;k++){
+        if(r===i && k===j) continue;
+        if(VM.rows[r].motions[k].id === id){
+          VM.rows[r].motions[k].id = old || null;
+          swaps.push([r,k]);
+        }
+      }
+    }
+  }
+  arm.id = id || null;
+  // 当前槽 + 被交换的槽一起重绑，统一在 swap 保护下完成再续播
+  vmSwapBegin();
+  let left = 1 + swaps.length;
+  vmApplyArm(i, j, ()=>{ if(--left<=0) vmSwapEnd(); });
+  swaps.forEach(([r,k])=> vmApplyArm(r,k, ()=>{ if(--left<=0) vmSwapEnd(); }));
+  vmRenderMgr();
+}
+/* done：本次 arm 绑定结束（同步命中缓存 / 异步成功 / 空 clip / 加载失败 / 过期）都会且只会调用一次。
+   播放中替换靠它统计「全部重绑完成」再恢复播放。 */
+function vmApplyArm(i, j, done){
+  const row = VM.rows[i], arm = row && row.motions[j];
+  if(!arm){ if(done) done(); return; }
+  vmStopArm(arm);
+  const token = arm.token;
+  const model = VM.models.find(m=>m.id === row.modelId);
+  const motion = VM.motions.find(m=>m.id === arm.id);
+  let finished = false;
+  const finish = ()=>{ if(finished) return; finished = true; if(done) done(); };
+  if(!model || !model.obj || !motion){
+    vmUpdateDuration(); vmRenderBar(); vmShowModelWhenReady(model); finish(); return;
+  }
+  const cached = motion.clips[model.id];
+  if(cached){ arm._loading = false; vmClipHit(motion, model.id, cached); vmAttachArm(row, arm, motion, cached, model.obj); finish(); return; }
+  // MMDLoader 解析 VMD 时，位置 track 会以「骨骼当前位置」为基准做转换。
+  // 若骨骼残留着上一个动作的位置（如 全ての親.x），解析出的 clip 值就会带脏偏移，
+  // 换个模型绑同一 VMD 时站位错乱。解析前先清回干净 bind pose。
+  vmResetToBind(model.obj);
+  arm._loading = true;                    // 正在异步解析：让新模型的显示等待它
+  new THREE.MMDLoader(makeManager('')).loadAnimation(vmURL(motion), model.obj, clip=>{
+    arm._loading = false;
+    if(arm.token !== token){ finish(); return; }   // 被后续替换接管：丢弃本次结果，但仍释放计数
+    if(!clip || !(clip.duration > 0)){
+      arm.id = null; vmUpdateDuration(); vmRenderMgr(); vmShowModelWhenReady(model);
+      // 动作槽里塞进来的其实是镜头 VMD：自动转到镜头；否则才是真的没匹配到骨骼
+      if(vmIsCameraVMD(motion.name)) vmApplyCamera(motion.id, true);
+      else toast('动作未匹配骨骼');
+      finish(); return;
+    }
+    motion.clips[model.id] = clip;
+    vmClipHit(motion, model.id, clip);
+    vmClipEvict();
+    vmAttachArm(row, arm, motion, clip, model.obj);
+    finish();
+  }, undefined, err=>{
+    arm._loading = false;
+    console.error(err);
+    toast('动作加载失败');
+    vmShowModelWhenReady(model);   // 加载失败也要显示模型，别一直隐藏
+    finish();
+  });
+}
+function vmAttachArm(row, arm, motion, clip, obj){
+  // 切动作先把骨骼位置基准清回 bind pose：否则新动作 VMD 未写到的位置骨骼
+  // 会残留上一个动作的值，表现为交换/替换后模型位置偏移。
+  vmResetToBind(obj);
+  const mixer = new THREE.AnimationMixer(obj);
+  const action = mixer.clipAction(clip);
+  action.loop = VM.loop ? THREE.LoopRepeat : THREE.LoopOnce;
+  action.play(); action.paused = !VM.playing;
+  arm.mixer = mixer; arm.action = action; arm.clip = clip; arm.root = obj;
+  vmUpdateDuration(); vmRenderMgr(); vmRenderBar();
+  try{ vmSeek(VM.time); }catch(e){}   // 立即落到当前进度的姿态（含 Grant/IK），暂停时也有正确画面
+  const m = VM.models.find(x=>x.obj === obj);
+  if(m) vmShowModelWhenReady(m);     // 姿态已就位，可以显示了
+  markDirty();
+}
+function vmApplyCamera(id, quiet=false){
+  if(!VM.on) vmEnter();
+  const hadCam = !!VM.camAction;         // 之前是否真有镜头在驱动相机
+  if(VM.camMixer){ try{ VM.camMixer.uncacheRoot(CAM); }catch(e){} }
+  VM.camMixer = null; VM.camAction = null; VM.camClip = null; VM.camId = id || null;
+  if(!id){
+    CTL.enabled = true;
+    // 镜头动画会把相机写到任意位置；去掉镜头后回到看模型的视角，别停在诡异机位
+    if(hadCam) try{ vmFitAll(); }catch(e){}
+    vmUpdateDuration(); vmRenderMgr(); vmRenderBar(); markDirty(); return;
+  }
+  const motion = VM.motions.find(m=>m.id === id); if(!motion) return;
+  const cached = motion.clips.camera;
+  if(cached){ vmClipHit(motion, 'camera', cached); vmAttachCameraClip(cached); return; }
+  new THREE.MMDLoader(makeManager('')).loadAnimation(vmURL(motion), CAM, clip=>{
+    if(!clip || !(clip.duration > 0)){ if(!quiet) toast('镜头动作无效'); VM.camId = null; vmUpdateDuration(); vmRenderMgr(); return; }
+    motion.clips.camera = clip;
+    vmClipHit(motion, 'camera', clip);
+    vmClipEvict();
+    vmAttachCameraClip(clip);
+  }, undefined, err=>{
+    console.error(err);
+    if(!quiet) toast('镜头动作加载失败');
+  });
+}
+function vmAttachCameraClip(clip){
+  if(!CAM.userData.vmTarget){
+    const tgt = new THREE.Object3D(); tgt.name = 'target';
+    CAM.add(tgt); CAM.userData.vmTarget = tgt;
+  }
+  const mixer = new THREE.AnimationMixer(CAM);
+  const action = mixer.clipAction(clip);
+  action.loop = VM.loop ? THREE.LoopRepeat : THREE.LoopOnce;
+  action.play(); action.paused = !VM.playing;
+  VM.camMixer = mixer; VM.camAction = action; VM.camClip = clip;
+  CTL.enabled = false;
+  vmUpdateDuration(); vmRenderMgr(); vmRenderBar(); markDirty();
+}
+function vmAddRow(){
+  vmEnsureRow(VM.rows.length);
+  vmRenderMgr();
+}
+function vmAddExtra(i){
+  const row = VM.rows[i]; if(!row) return;
+  row.motions.push(vmEmptyArm());
+  vmRenderMgr();
+}
+function vmDelArm(i, j){
+  const row = VM.rows[i], arm = row && row.motions[j]; if(!arm) return;
+  vmStopArm(arm);
+  const id = arm.id;
+  row.motions.splice(j,1);
+  if(!row.motions.length) row.motions.push(vmEmptyArm());
+  if(id && !VM.rows.some(r=>r.motions.some(a=>a.id===id)) && VM.camId !== id){
+    VM.motions = VM.motions.filter(m=>m.id !== id);
+  }
+  vmUpdateDuration(); vmRenderMgr(); vmRenderBar(); markDirty();
+}
+function vmDelRow(i){
+  const row = VM.rows[i]; if(!row) return;
+  vmStopRow(row);
+  if(row.modelId){
+    const m = VM.models.find(x=>x.id === row.modelId);
+    if(m) vmRemoveModelObj(m);
+  }
+  const ids = row.motions.map(a=>a.id).filter(Boolean);
+  VM.rows.splice(i,1);
+  if(!VM.rows.length) VM.rows.push(vmEmptyRow());
+  for(const id of ids){
+    if(!VM.rows.some(r=>r.motions.some(a=>a.id === id)) && VM.camId !== id){
+      VM.motions = VM.motions.filter(m=>m.id !== id);
+    }
+  }
+  vmUpdateVisibility();
+  vmLayoutModels();
+  vmUpdateDuration(); vmRenderMgr(); vmRenderBar(); markDirty();
+}
+
+function vmFitAll(){
+  const ms = VM.models.filter(m=>m.obj && m.obj.visible !== false);
+  if(!ms.length || !R || !CAM) return;
+  const box = new THREE.Box3();
+  ms.forEach(m=>{ try{ box.expandByObject(m.obj); }catch(e){} });
+  if(box.isEmpty()) return;
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z) || 10;
+  const fov = CAM.fov * Math.PI / 180;
+  let dist = (maxDim/2) / Math.tan(fov/2) * 1.5;
+  dist = Math.max(dist, 12);
+  CAM.position.set(center.x, center.y + size.y*0.1, center.z + dist);
+  CAM.lookAt(center);
+  if(CTL){ CTL.target.copy(center); CTL.update(); }
+  markDirty();
+}
+
+function vmPlay(){
+  if(!VM.rows.some(r=>r.motions.some(a=>a.action)) && !VM.camAction){ toast('还没有加载动作'); return; }
+  VM.playing = true;
+  VM.lastTick = performance.now();
+  for(const r of VM.rows) for(const a of r.motions) if(a.action){
+    a.action.loop = VM.loop ? THREE.LoopRepeat : THREE.LoopOnce;
+    a.action.paused = false;
+  }
+  if(VM.camAction){
+    VM.camAction.loop = VM.loop ? THREE.LoopRepeat : THREE.LoopOnce;
+    VM.camAction.paused = false;
+    CTL.enabled = false;
+  }
+  const au = vmCurAudio();
+  if(au){
+    // 播放前先对齐到时间轴当前位置：移除后重新加载的新音频 currentTime=0，
+    // 若不经这里对齐就会从头播，与进度条/动作错位。
+    vmSeekAudio(VM.time);
+    try{ au.el.play().catch(()=>{}); }catch(e){}
+  }
+  vmRenderBar();
+  if(typeof vmNavRefresh === 'function') vmNavRefresh();
+}
+function vmStop(){
+  VM.playing = false;
+  for(const r of VM.rows) for(const a of r.motions) if(a.action) a.action.paused = true;
+  if(VM.camAction){ VM.camAction.paused = true; CTL.enabled = true; }
+  for(const a of VM.audios) try{ a.el.pause(); }catch(e){}
+  vmRenderBar();
+  if(typeof vmNavRefresh === 'function') vmNavRefresh();
+}
+function vmActiveObjs(){ return VM.models.filter(m=>m.obj && m.obj.visible !== false).map(m=>m.obj); }
+function vmSeek(t){
+  VM.time = t;
+  const objs = vmActiveObjs();
+  // Grant/IK 基于「纯动画」基准求解，先恢复骨骼再写动画值，避免逐帧累积
+  for(const o of objs) vmRestoreBones(o);
+  /* 暂停状态下 three.js 的 setTime 不写入骨骼，先临时恢复后再还原暂停态 */
+  for(const r of VM.rows) for(const a of r.motions) if(a.mixer){
+    const was = a.action ? a.action.paused : false;
+    if(a.action) a.action.paused = false;
+    a.mixer.setTime(t);
+    if(a.action) a.action.paused = was;
+  }
+  if(VM.camMixer){
+    const was = VM.camAction ? VM.camAction.paused : false;
+    if(VM.camAction) VM.camAction.paused = false;
+    VM.camMixer.setTime(t);
+    if(VM.camAction) VM.camAction.paused = was;
+  }
+  for(const o of objs) vmRunIK(o);
+  vmSeekAudio(t);
+  markDirty();
+}
+/* 把音频对齐到时间轴 t。大音频未缓冲到目标位置时直接设 currentTime 会被浏览器
+   钳制到已缓冲的边界；用一次性 canplay/seeked 监听重试，直到误差可接受。 */
+function vmSeekAudio(t){
+  const au = vmCurAudio(); if(!au) return;
+  const el = au.el;
+  if(!isFinite(el.duration)){
+    // 元数据还没加载好：等 loadedmetadata 后再对齐一次
+    try{ el.addEventListener('loadedmetadata', ()=>vmSeekAudio(VM.time), {once:true}); }catch(e){}
+    return;
+  }
+  const target = Math.max(0, Math.min(t, el.duration - 0.05));
+  // 给每个音频元素一个独立的对齐令牌，避免上一次 seek 的轮询还在跑
+  const seq = (el._vmSeekSeq = (el._vmSeekSeq || 0) + 1);
+  const step = (n)=>{
+    if(el._vmSeekSeq !== seq) return;               // 有新的 seek 接管了
+    try{
+      if(Math.abs(el.currentTime - target) > 0.4) el.currentTime = target;
+    }catch(e){}
+    if(Math.abs(el.currentTime - target) <= 0.4 || n <= 0) return;
+    // 大文件要从头缓冲到目标位置，可能需要几秒；200ms 轮询，最多 ~10 秒
+    setTimeout(()=>step(n-1), 200);
+  };
+  step(50);
+}
+function vmTick(now){
+  if(!VM.on || !VM.playing) return false;
+  const dt = Math.min(0.1, (now - VM.lastTick)/1000) * VM.speed;
+  VM.lastTick = now;
+  const objs = vmActiveObjs();   // 只解算被选中/可见的模型，隐藏候选不耗 CPU
+  for(const o of objs) vmRestoreBones(o);   // 恢复到纯动画基准，再让 mixer 写入本帧
+  for(const r of VM.rows) for(const a of r.motions) if(a.mixer) a.mixer.update(dt);
+  if(VM.camMixer) VM.camMixer.update(dt);
+  // 骨骼动画写的是 IK 目标；随后按 PMX 顺序解算 Grant + IK 才能驱动腿/脚/腰
+  for(const o of objs) vmRunIK(o);
+  VM.time += dt;
+  if(VM.duration > 0){
+    if(VM.time >= VM.duration){
+      if(VM.loop){ VM.time = 0; vmSeek(0); }
+      else{ VM.time = VM.duration; vmStop(); }
+    }
+  }
+  const bar = document.querySelector('[data-vmseek]');
+  if(bar && !VM.seekLock) bar.value = VM.duration ? (VM.time/VM.duration*1000) : 0;
+  const lab = document.getElementById('vmTime');
+  if(lab) lab.textContent = vmFmt(VM.time) + ' / ' + vmFmt(VM.duration);
+  return true;
+}
+function vmFmt(s){
+  s = Math.max(0, s|0);
+  const m = (s/60)|0, ss = s%60;
+  return String(m).padStart(2,'0') + ':' + String(ss).padStart(2,'0');
+}
+
+function vmRenderBar(){
+  let bar = document.getElementById('vmBar');
+  if(!bar){
+    bar = document.createElement('div');
+    bar.id = 'vmBar'; bar.className = 'vmbar';
+    const wrap = document.getElementById('canvasWrap');
+    if(wrap) wrap.appendChild(bar);
+  }
+  const tab = document.getElementById('vmBarTab');
+  if(tab){
+    tab.classList.toggle('on', VM.on);
+    tab.textContent = VM.barCollapsed ? '▴' : '▾';
+    tab.onclick = ()=>{ VM.barCollapsed = !VM.barCollapsed; vmRenderBar(); };
+  }
+  bar.classList.toggle('on', VM.on);
+  bar.classList.toggle('hide', VM.on && VM.barCollapsed);
+  if(!VM.on || VM.barCollapsed) return;
+  const seekVal = VM.duration ? Math.round(VM.time / VM.duration * 1000) : 0;
+  bar.innerHTML = `<button class="vmplay" id="vmPlayBtn">${VM.playing?'⏸':'▶'}</button>
+     <input type="range" data-vmseek min="0" max="1000" value="${seekVal}" ${VM.duration?'':'disabled'}>
+     <span class="vmt" id="vmTime">${vmFmt(VM.time)} / ${vmFmt(VM.duration)}</span>
+     <select id="vmSpeed" title="播放速度">
+       ${[0.25,0.5,0.75,1,1.5,2].map(v=>`<option value="${v}" ${v===VM.speed?'selected':''}>${v}×</option>`).join('')}
+     </select>
+     <span class="vmvol"><span class="vmvolico" id="vmVolIco" title="静音 / 取消静音">${VM.volume>0?'🔊':'🔇'}</span>
+       <span class="vmvolpop"><input type="range" data-vmvol min="0" max="100" value="${Math.round(VM.volume*100)}" title="音量"></span></span>
+     <button class="vmlp ${VM.loop?'on':''}" id="vmLoopBtn">循环</button>`;
+  document.getElementById('vmPlayBtn').onclick = ()=> VM.playing ? vmStop() : vmPlay();
+  document.getElementById('vmSpeed').onchange = e=>{
+    VM.speed = parseFloat(e.target.value)||1;
+    vmApplySpeed();   // 音频跟着变速，与动画 VTick 的 dt*speed 一致
+  };
+  const vol = bar.querySelector('[data-vmvol]');
+  const volIco = document.getElementById('vmVolIco');
+  vol.oninput = e=>{
+    VM.volume = Math.max(0, Math.min(1, parseFloat(e.target.value)/100));
+    vmApplyVolume();
+    if(volIco) volIco.textContent = VM.volume>0 ? '🔊' : '🔇';
+  };
+  volIco.onclick = ()=>{
+    if(VM.volume>0){ VM._vmMuteVol = VM.volume; VM.volume = 0; }
+    else{ VM.volume = VM._vmMuteVol || 1; VM._vmMuteVol = 0; }
+    vmApplyVolume();
+    vol.value = Math.round(VM.volume*100);
+    volIco.textContent = VM.volume>0 ? '🔊' : '🔇';
+  };
+  document.getElementById('vmLoopBtn').onclick = e=>{
+    VM.loop = !VM.loop;
+    for(const r of VM.rows) for(const a of r.motions) if(a.action) a.action.loop = VM.loop ? THREE.LoopRepeat : THREE.LoopOnce;
+    if(VM.camAction) VM.camAction.loop = VM.loop ? THREE.LoopRepeat : THREE.LoopOnce;
+    for(const au of VM.audios) au.el.loop = VM.loop;
+    e.currentTarget.classList.toggle('on', VM.loop);
+  };
+  const seek = bar.querySelector('[data-vmseek]');
+  seek.oninput = e=>{ VM.seekLock = true; vmSeek((parseFloat(e.target.value)/1000)*VM.duration); };
+  seek.onchange = ()=>{ VM.seekLock = false; };
+}
+
+function vmSyncNormalModel(f, path, obj){
+  if(typeof VM === 'undefined' || VM.on) return;
+  const keepMotions = VM.motions.slice();
+  const keepArms = VM.rows[0] ? VM.rows[0].motions.map(a=>a.id) : [];
+  const keepCam = VM.camId;
+  VM.models = [];
+  VM.rows = [vmEmptyRow()];
+  VM.motions = keepMotions;
+  VM.rows[0].motions = keepArms.map(id=>Object.assign(vmEmptyArm(),{id}));
+  VM.camId = keepCam; VM.camMixer = null; VM.camAction = null; VM.camClip = null;
+  VM.duration = 0; VM.time = 0;
+  if(/\.(pmx|pmd)$/i.test(f.name || '')){
+    const m = {id:++_vmId, name:f.name, path, arc:curModelPath || S.cur, pwd:S.pwd, obj};
+    VM.models.push(m);
+    VM.rows[0].modelId = m.id;
+    vmBuildIK(obj);
+  }
+  vmRenderMgr();
+}
+/* ===== 候选下拉：模型/音频项悬停出现 ×，可从池里直接去掉 ===== */
+let _vmdd = null;
+function vmDDClose(){ if(_vmdd){ _vmdd.pop.remove(); _vmdd = null; } }
+function vmDDButton(kind, row, name, slot){
+  return `<div class="vmdd-btn" data-vmdd="${kind}" data-row="${row}" data-slot="${slot||0}" title="${esc(name)}">
+    <span class="vmdd-lb">${esc(name)}</span><span class="vmdd-ar">▾</span></div>`;
+}
+function vmDDPoolName(list, id){ const x = list.find(v=>v.id===id); return x ? x.name : '—'; }
+function vmDDOpen(btn){
+  vmDDClose();
+  const kind = btn.dataset.vmdd, row = +btn.dataset.row || 0, slot = +btn.dataset.slot || 0;
+  const isAudio = kind === 'audio', isCam = kind === 'cam', isMotion = kind === 'motion';
+  const list = (isAudio ? VM.audios : (isMotion || isCam) ? VM.motions : VM.models);
+  const curId = isAudio ? VM.audioId
+    : isCam ? VM.camId
+    : isMotion ? (VM.rows[row] && VM.rows[row].motions[slot] ? VM.rows[row].motions[slot].id : null)
+    : (VM.rows[row] ? VM.rows[row].modelId : null);
+  const pop = document.createElement('div');
+  pop.className = 'vmdd-pop';
+  pop.innerHTML = `<div class="vmdd-it ${curId==null?'on':''}" data-id="">— 不选择 —</div>` +
+    list.map(x=>`<div class="vmdd-it ${x.id===curId?'on':''}" data-id="${x.id}">
+        <span class="vmdd-nm">${esc(x.name)}</span>
+        <button class="vmdd-x" title="从候选移除">×</button>
+      </div>`).join('');
+  document.body.appendChild(pop);
+  const r = btn.getBoundingClientRect();
+  pop.style.left = Math.max(6, Math.min(r.left, innerWidth - pop.offsetWidth - 6)) + 'px';
+  const below = r.bottom + 3, above = r.top - pop.offsetHeight - 3;
+  pop.style.top = (below + pop.offsetHeight <= innerHeight - 6 ? below : Math.max(6, above)) + 'px';
+  pop.querySelectorAll('.vmdd-it').forEach(it=>it.addEventListener('click', ev=>{
+    if(ev.target.closest('.vmdd-x')){
+      ev.stopPropagation();
+      const id = +it.dataset.id;
+      if(isAudio) vmDelAudio(id);
+      else if(isMotion || isCam) vmRemoveMotionFromPool(id);
+      else vmRemoveModelFromPool(id);
+      vmDDClose(); return;
+    }
+    const id = it.dataset.id ? +it.dataset.id : null;
+    if(isAudio) vmApplyAudio(id);
+    else if(isCam) vmApplyCamera(id);
+    else if(isMotion) vmApplyMotionSwitch(row, slot, id);
+    else vmApplyModelSwitch(row, id);
+    vmDDClose();
+  }));
+  _vmdd = {pop};
+}
+/* 从候选池移除一个动作/镜头：清掉所有行和镜头对它的引用，再从池里删掉 */
+function vmRemoveMotionFromPool(id){
+  if(!VM.motions.some(m=>m.id===id)) return;
+  VM.rows.forEach(r=>r.motions.forEach(a=>{
+    if(a.id === id){ vmStopArm(a); a.id=null; a.clip=null; a.mixer=null; a.action=null; a.root=null; if(a._loading) a._loading=false; }
+  }));
+  VM.rows.forEach(r=>{ if(!r.motions.length) r.motions.push(vmEmptyArm()); });
+  if(VM.camId === id){ if(VM.camMixer){ try{ VM.camMixer.uncacheRoot(CAM); }catch(e){} } VM.camId=null; VM.camMixer=null; VM.camAction=null; VM.camClip=null; }
+  VM.motions = VM.motions.filter(m=>m.id !== id);
+  vmUpdateDuration(); vmRenderMgr(); vmRenderBar(); markDirty();
+}
+function vmRemoveModelFromPool(id){
+  const m = VM.models.find(x=>x.id===id); if(!m) return;
+  VM.rows.forEach(r=>{ if(r.modelId === id) r.modelId = null; });
+  vmRemoveModelObj(m, false);
+  vmSyncActive(); vmRenderMgr(); markDirty();   // 视口立即重画，模型当场消失
+}
+document.addEventListener('click', e=>{
+  const b = e.target.closest('[data-vmdd]');
+  if(b){ e.stopPropagation(); vmDDOpen(b); return; }
+  if(_vmdd) vmDDClose();
+});
+
+function vmRenderMgr(){
+  const foot = document.getElementById('vmFoot');
+  if(!foot) return;
+  const opt = (arr, cur)=>`<option value="">—</option>` + arr.map(x=>
+    `<option value="${x.id}" ${x.id===cur?'selected':''}>${esc(x.name)}</option>`).join('');
+  let h = `<div class="vmtop">
+    <div class="vmgrp"><span>音频</span>${vmDDButton('audio', 0, vmDDPoolName(VM.audios, VM.audioId))}</div>
+    <div class="vmgrp"><span>镜头</span>${vmDDButton('cam', 0, vmDDPoolName(VM.motions, VM.camId))}</div>
+  </div><div class="vmrows">`;
+  VM.rows.forEach((r,i)=>{
+    const main = r.motions[0] || vmEmptyArm();
+    h += `<div class="vmrow">
+      <span class="idx">${i+1}</span>
+      ${vmDDButton('model', i, vmDDPoolName(VM.models, r.modelId))}
+      ${vmDDButton('motion', i, vmDDPoolName(VM.motions, main.id), 0)}
+      <button data-vmadd="${i}" title="添加行">＋</button>
+      <button class="vmaddmo" data-vmaddmo="${i}" title="添加 VMD">+VMD</button>
+      <button class="vmdel" data-vmdel="${i}" title="删除行">−</button>
+    </div>`;
+    r.motions.slice(1).forEach((a,j)=>{
+      const k = j+1;
+      h += `<div class="vmextra">
+        <span></span>
+        ${vmDDButton('motion', i, vmDDPoolName(VM.motions, a.id), k)}
+        <button class="vmdel" data-vmdelmo="${i}-${k}" title="移除这个 VMD">−</button>
+      </div>`;
+    });
+  });
+  h += `</div>`;
+  foot.innerHTML = h;
+  $$('#vmFoot [data-vmadd]').forEach(b=> b.onclick = ()=> vmAddRow());
+  $$('#vmFoot [data-vmaddmo]').forEach(b=> b.onclick = ()=> vmAddExtra(+b.dataset.vmaddmo));
+  $$('#vmFoot [data-vmdel]').forEach(b=> b.onclick = ()=> vmDelRow(+b.dataset.vmdel));
+  $$('#vmFoot [data-vmdelmo]').forEach(b=> b.onclick = ()=>{
+    const p = b.dataset.vmdelmo.split('-').map(Number);
+    vmDelArm(p[0], p[1]);
+  });
+}
+function vmOpenMgr(){ vmRenderMgr(); }
+function vmLoadRole(f){ return vmAddModel(f, 0); }
+function vmLoadMotion(f, i){ return vmAddMotion(f, i == null ? 0 : i); }
+
 async function loadModel(path){
+  // 从 VMD 模式切回普通预览
+  if(typeof VM !== 'undefined' && VM.on) vmExit();
+  vmSetFootTab('normal');
   const seq = ++_loadSeq;     // 本次加载的序号，后面任何一步发现变了就放弃
   const f = S.files.find(x=>x.path===path);
   if(!f) return;
@@ -3695,6 +6994,7 @@ async function loadModel(path){
     };
     setTimeout(expoLoop, 2600);
     renderViewFoot(f, {meshes, verts, missing: missingTex});
+    vmSyncNormalModel(f, path, OBJ);
   };
 
   try{
@@ -3750,7 +7050,6 @@ function renderViewFoot(f, stats){
     <button class="fbtn" id="vReset">重置视角</button>
     <button class="fbtn" id="vSpin">自动旋转</button>
     <button class="fbtn ${S.mouseMode==='alt'?'on':''}" id="vMouse" title="切换鼠标操作：默认=左键旋转/右键平移；右键旋转=右键旋转/左键平移">鼠标:${S.mouseMode==='alt'?'右键旋转':'默认'}</button>
-    <button class="fbtn" id="vDiag" title="打印当前模型的材质/光照状态">诊断</button>
     <button class="fbtn" id="vDownload">下载</button>
   </div>
   <div class="lightrow">
@@ -3795,30 +7094,6 @@ function renderViewFoot(f, stats){
     $('#vMouse').classList.toggle('on', S.mouseMode==='alt');
   };
   $('#vDownload').onclick = ()=>download(f.path);
-  if($('#vDiag')) $('#vDiag').onclick = ()=>{
-    const lines = [];
-    let nmat = 0, ntoon = 0, gmOk = 0, gmNo = 0, withMap = 0, withEmis = 0;
-    if(OBJ) OBJ.traverse(o=>{
-      if(!o.material) return;
-      (Array.isArray(o.material)?o.material:[o.material]).forEach(m=>{
-        nmat++;
-        if(m.map) withMap++;
-        if(m.emissive && (m.emissive.r || m.emissive.g || m.emissive.b)) withEmis++;
-        if(!m.isMeshToonMaterial) return;
-        ntoon++;
-        const im = m.gradientMap && m.gradientMap.image;
-        if(im && im.width) gmOk++; else gmNo++;
-      });
-    });
-    lines.push('材质 ' + nmat + ' · toon ' + ntoon + ' · 有贴图 ' + withMap + ' · 有 emissive ' + withEmis);
-    lines.push('toon 贴图：已解码 ' + gmOk + ' / 未解码 ' + gmNo);
-    lines.push('光照 ' + S.light.toFixed(2) + '× ' + (S.lightColor || '#ffffff') +
-               ' · 曝光 ' + (R ? R.toneMappingExposure.toFixed(2) : '-'));
-    lines.push('物体 ' + (OBJ ? (OBJ.type + ' 子节点 ' + OBJ.children.length) : '无'));
-    dialog('<h3>诊断</h3><div class="body"><pre style="white-space:pre-wrap;font-size:12px;line-height:1.7">'
-      + esc(lines.join('\n')) + '</pre></div><div class="foot"><button class="fbtn solid" id="dgOk">好</button></div>',
-      ()=>{ $('#dgOk').onclick = closeDialog; });
-  };
   $('#lightSlider').oninput = ev=>{
     S.light = parseFloat(ev.target.value);
     $('#lightVal').textContent = S.light.toFixed(2) + '×';
@@ -4519,18 +7794,29 @@ document.addEventListener('click', e=>{ if(!ctx.contains(e.target)) ctx.classLis
 
 function archiveMenu(ev, path){
   const a = S.archives.find(x=>x.path===path);
+  const rawEv = ev;
+  // 批量模式下右键已选中的项：可批量的动作对整个选中集合生效
+  const inBatch = !!(S.batch && S.batch.on && S.batch.sel.has(path) && S.batch.sel.size > 1);
+  const targets = inBatch ? [...S.batch.sel] : [path];
+  const hint = inBatch ? `（${targets.length} 项）` : '';
   showCtx(ev, [
-    {icon:'', label:'进入批量模式', run:()=>batchEnter(path)},
+    (S.batch && S.batch.on)
+      ? {icon:'', label:'退出批量模式', run:()=>batchExit()}
+      : {icon:'', label:'进入批量模式', run:()=>batchEnter(path)},
+    {icon:'', label:'定位到目录'+hint, run:()=> inBatch ? locateArchives(targets) : locateArchive(path)},
     '-',
-    {icon:'', label:'移动到…', run:()=>pickFolder('移动到…', dst=>moveTo(path, dst))},
-    {icon:'', label:'打开所在文件夹', run:()=>post('/api/fs/reveal',{path})},
-    {icon:'', label:'复制完整路径', run:()=>copyText(path)},
+    {icon:'', label:'移动到…'+hint, run:()=> inBatch ? batchMove(targets) : pickFolder('移动到…', dst=>moveTo(path, dst), null, '移动到这里')},
+    {icon:'', label:'复制到…'+hint, run:()=> inBatch ? pickFolder('复制到…', dst=>batchCopyTo(dst), null, '复制到这里') : pickFolder('复制到…', dst=>copyTo(path, dst), null, '复制到这里')},
+    {icon:'', label:'打开所在文件夹'+hint, run:()=> inBatch ? revealArchives(targets) : post('/api/fs/reveal',{path})},
     '-',
-    {icon:'', label:'删除预览图', run:()=>delCover(path)},
-    {icon:'', label:'解压到…', run:()=>askExtract(path, a)},
-    {icon:'', label:'重命名…', run:()=>askRename(path)},
+    // 单项 / 批量都进同一个管理面板；批量时按选中集合整体处理
+    {icon:'', label:'管理标签…'+hint, run:()=> openTagPanel(rawEv, targets)},
+    {icon:'', label:'生成预览图'+hint, run:()=> inBatch ? batchCovers(targets) : genCoverForArchive(path)},
+    {icon:'', label:'删除预览图'+hint, run:()=> inBatch ? batchDelCovers(targets) : delCover(path)},
+    {icon:'', label:'解压到…'+hint, run:()=> inBatch ? askBatchExtract(targets) : askExtract(path, a)},
+    {icon:'', label:'重命名…'+hint, run:()=> inBatch ? batchRename(targets) : askRename(path)},
     '-',
-    {icon:'', label:'删除到回收站', danger:true, run:()=>askTrash(path)}
+    {icon:'', label:'删除到回收站'+hint, danger:true, run:()=> inBatch ? batchTrash(targets) : askTrash(path)}
   ]);
 }
 
@@ -4550,7 +7836,10 @@ async function delCover(path){
 function fileMenu(ev, inner){
   const f = S.files.find(x=>x.path===inner);
   const items = [];
-  if(f && f.is_3d) items.push({icon:'', label:'在视口预览', run:()=>loadModel(inner)});
+  if(f && f.is_3d){
+    items.push({icon:'', label:'在视口预览', run:()=>loadModel(inner)});
+    items.push({icon:'', label:'生成预览图', run:()=>genCoverFromModel(inner)});
+  }
   if(f && f.is_pmx && !(S.openers && S.openers['.pmx']))
     items.push({icon:'', label:'用 PMXEditor 打开', run:()=>openEditor(inner)});
   if(f && S.openers && S.openers[f.ext]){
@@ -4589,8 +7878,9 @@ function copyText(t){
 }
 
 /* ===================== 对话框 ===================== */
-function dialog(html, onOpen){
+function dialog(html, onOpen, width){
   $('#dlg').innerHTML = html;
+  $('#dlg').style.width = width ? ('min('+width+'px, 94vw)') : '';
   $('#mask').classList.add('on');
   if(onOpen) onOpen();
 }
@@ -4602,7 +7892,7 @@ function closeDialog(){
 $('#mask').onclick = e=>{ if(e.target.id==='mask') closeDialog(); };
 
 function askRename(path){
-  const cur = path.split('/').pop();
+  const cur = path.split(/[\\/]/).filter(Boolean).pop();
   dialog(`<h3>重命名</h3>
     <div class="body">
       <input id="rnInput" value="${esc(cur)}">
@@ -4618,13 +7908,14 @@ function askRename(path){
     if(!name) return;
     const d = await post('/api/fs/rename', {path, name});
     if(d.error) return alert(d.error);
-    closeDialog(); await loadMeta(); renderArchiveList();
+    if(d.path) pushUndo('rename', path, d.path);
+    closeDialog(); if(!applyMeta(d.meta)) await loadMeta(); renderNav(); renderArchiveList();
   };
   $('#rnInput').onkeydown = e=>{ if(e.key==='Enter') $('#rnOk').click(); };
 }
 
 function askTrash(path){
-  const name = path.split('/').pop();
+  const name = path.split(/[\\/]/).filter(Boolean).pop();
   dialog(`<h3>删除</h3>
     <div class="body">
       <div class="note">将把 <b>${esc(name)}</b> 移到本工具的回收站<br>
@@ -4638,39 +7929,71 @@ function askTrash(path){
   $('#trOk').onclick = async ()=>{
     const d = await post('/api/fs/trash', {path});
     if(d.error) return alert(d.error);
-    closeDialog(); await loadMeta(); renderArchiveList();
+    if(d.trash) pushUndo('trash', path, d.trash);
+    closeDialog(); if(!applyMeta(d.meta)) await loadMeta(); renderNav(); renderArchiveList();
   };
 }
 
+function archiveDir(p){
+  const a = (S.archives||[]).find(x=>x.path===p);
+  if(a && a.dir) return a.dir;
+  return String(p).replace(/\\/g,'/').replace(/\/[^/]*$/,'');
+}
+/* 批量右键用的共同目录：跨文件夹选择时退到共同上级，不强行跳到某一个包 */
+function commonArchiveDir(paths){
+  const norm = s=>String(s||'').replace(/\\/g,'/').replace(/\/+$/,'');
+  const dirs = (paths||[]).map(p=>norm(archiveDir(p))).filter(Boolean);
+  if(!dirs.length) return '';
+  let parts = dirs[0].split('/');
+  for(const d of dirs.slice(1)){
+    const x = d.split('/'); let i=0;
+    while(i<parts.length && i<x.length && parts[i].toLowerCase()===x[i].toLowerCase()) i++;
+    parts = parts.slice(0,i);
+  }
+  return parts.join('/') || dirs[0].split('/')[0];
+}
+function locateArchives(paths){
+  if(!paths || !paths.length) return;
+  const dir = commonArchiveDir(paths), low = dir.toLowerCase();
+  const root = (S.meta && S.meta.roots || []).find(r=>{
+    const rp = String(r.path).replace(/\\/g,'/').replace(/\/+$/,'').toLowerCase();
+    return low === rp || low.startsWith(rp + '/');
+  });
+  if(!root) return locateArchive(paths[0]);
+  const rp = String(root.path).replace(/\\/g,'/').replace(/\/+$/,'');
+  const group = dir.slice(rp.length).replace(/^\/+/,'');
+  const q=$('#q'); if(q) q.value='';
+  S.innerMode=false; if($('#innerBtn')) $('#innerBtn').classList.remove('on');
+  endGlobalSearch();
+  S.sel = group ? {type:'group',root:root.path,group} : {type:'root',root:root.path};
+  S.dup=null; if($('#dupBtn')) $('#dupBtn').classList.remove('on');
+  S.page=1; renderNav(); renderArchiveList();
+  const rows = $$('#content [data-archive]');
+  const first = paths.find(p=>rows.some(x=>x.dataset.archive===p));
+  const el = first && rows.find(x=>x.dataset.archive===first);
+  if(el && el.scrollIntoView){
+    try{ el.scrollIntoView({block:'center',behavior:'smooth'}); }catch(e){ el.scrollIntoView(); }
+  }
+}
+function revealArchives(paths){
+  if(!paths || !paths.length) return;
+  post('/api/fs/reveal', {path:commonArchiveDir(paths)});
+}
+function askBatchExtract(paths){
+  if(!paths || !paths.length) return toast('先选几个');
+  const last = S.batch && S.batch.anchor && paths.includes(S.batch.anchor) ? S.batch.anchor : paths[paths.length-1];
+  pickFolder('解压选中项到…', dst=>batchExtract(paths, dst), null, '解压到这里', archiveDir(last));
+}
 function askExtract(path, a){
+  // 和「移动到… / 复制到…」用同一套目录树面板；默认选中压缩包所在目录
   const stem = (a?a.name:path.split('/').pop()).replace(/\.[^.]+$/,'');
-  const def = (a?a.dir:path.slice(0,path.lastIndexOf('/'))) + '/' + stem;
-  dialog(`<h3>解压到</h3>
-    <div class="body">
-      <input id="exInput" value="${esc(def)}">
-      <div class="note">这是真实解压，会把全部文件写到目标文件夹</div>
-    </div>
-    <div class="foot">
-      <button class="fbtn" id="exCancel">取消</button>
-      <button class="fbtn solid" id="exOk">开始解压</button>
-    </div>`, ()=>{ $('#exInput').focus(); });
-  $('#exCancel').onclick = closeDialog;
-  $('#exOk').onclick = async ()=>{
-    const target = $('#exInput').value.trim();
-    if(!target) return;
-    $('#exOk').textContent = '解压中…';
-    $('#exOk').disabled = true;
+  pickFolder('解压到…', async dst=>{
+    const target = String(dst).replace(/\\/g,'/') + '/' + stem;
     const d = await post('/api/fs/extract', {path, target, password:S.pwd});
-    if(d.error){
-      alert(d.error);
-      $('#exOk').textContent = '开始解压';
-      $('#exOk').disabled = false;
-      return;
-    }
-    closeDialog();
+    if(d.error) return alert(d.error);
     await loadMeta();
     alert('已解压到：\n' + d.target);
-  };
+  }, null, '解压到这里', archiveDir(path));
 }
 
 /* ===================== 设置 ===================== */
@@ -4743,7 +8066,8 @@ function openSettings(){
         <button class="settab" data-tab="shot">截图</button>
         <button class="settab" data-tab="fmt">格式关联</button>
         <button class="settab" data-tab="pwd">密码管理</button>
-        <button class="settab" data-tab="browser">鼠标手势</button>
+        <button class="settab" data-tab="other">其他设置</button>
+        <button class="settab" data-tab="backup">备份</button>
       </div>
       <div class="setbody">
         <div class="setsec" data-sec="dirs">
@@ -4751,6 +8075,13 @@ function openSettings(){
           <div id="rootRows"></div>
           <button class="fbtn" id="addRoot" style="margin:6px 0 10px">+ 添加目录</button>
           <div class="note">工具扫描这些目录下的压缩包（zip / 7z / rar / 自解压 exe）。</div>
+
+          <label style="margin-top:14px">维护</label>
+          <div class="rootrow" style="margin-bottom:8px">
+            <button class="fbtn" id="clearCache">清空缓存</button>
+            <button class="fbtn" id="showLog">查看日志</button>
+          </div>
+          <div class="note">缓存只是解压/缩略图的中间产物，清空后下次浏览会重新生成。</div>
         </div>
         <div class="setsec hide" data-sec="shot">
           <label>截图命名</label>
@@ -4791,18 +8122,30 @@ function openSettings(){
           <div class="note">保存的密码会在打开加密压缩包时列出来，点一下就能用。<br>
             明文保存在 config.json 里，别把这份配置发给别人。</div>
         </div>
-        <div class="setsec hide" data-sec="browser">
-          <label>右键拖动被浏览器抢走了？</label>
-          <div class="note" style="margin-bottom:10px">
-            Edge 自带的<b>「鼠标手势」</b>会在按住右键拖动时弹出前进 / 后退 / 滚动提示，
-            网页这边拦不住它。点下面的按钮打开本工具所用浏览器配置的外观设置，
-            把「鼠标手势」关掉，右键按住就能直接旋转了。
+        <div class="setsec hide" data-sec="other">
+          <label>鼠标手势（默认关闭）</label>
+          <div class="rootrow">
+            <label class="sw" style="margin:0">
+              <input type="checkbox" id="gestureSw">
+              <span class="seg">
+                <em class="on" id="gestureOn">开启</em>
+                <em class="off" id="gestureOff">禁用</em>
+              </span>
+            </label>
           </div>
-          <button class="fbtn" id="openEdgeSettings">打开 Edge 外观设置</button>
+          <div class="note">开启后重启窗口生效。右键拖动可能被浏览器手势接管，正常情况下保持关闭。</div>
+        </div>
+        <div class="setsec hide" data-sec="backup">
+          <label>配置与索引</label>
+          <div class="rootrow">
+            <button class="fbtn" id="backupExport">导出备份</button>
+            <button class="fbtn" id="backupImport">导入备份</button>
+          </div>
         </div>
       </div>
     </div>
     <div class="foot">
+      <span style="flex:1;font-size:11px;color:var(--text3);align-self:center">Zip2mmd v__APP_VERSION__</span>
       <button class="fbtn" id="stCancel">取消</button>
       <button class="fbtn solid" id="stSave">保存</button>
     </div>`, ()=>{
@@ -4814,6 +8157,26 @@ function openSettings(){
         $$('#dlg .settab').forEach(b=>b.classList.toggle('on', b === btn));
         $$('#dlg .setsec').forEach(s=>s.classList.toggle('hide', s.dataset.sec !== btn.dataset.tab));
       });
+      // 鼠标手势分段开关：按当前浏览器实际状态显示；不支持的浏览器禁用
+      fetch('/api/gesture').then(r=>r.json()).then(g=>{
+        const sw=$('#gestureSw'), onEl=$('#gestureOn'), offEl=$('#gestureOff');
+        if(!sw || !onEl || !offEl) return;
+        const paint=()=>{ onEl.classList.toggle('active',sw.checked); offEl.classList.toggle('active',!sw.checked); };
+        const set=async v=>{
+          if(sw.checked===v) return;
+          sw.checked=v; paint();
+          await post('/api/gesture',{on:v});
+          toast(v?'已开启鼠标手势（需重启窗口生效）':'已关闭鼠标手势（需重启窗口生效）');
+        };
+        onEl.onclick=e=>{ e.preventDefault(); set(true); };
+        offEl.onclick=e=>{ e.preventDefault(); set(false); };
+        sw.onchange=paint;
+        if(!g.supported){
+          sw.disabled=true; onEl.style.opacity=.5; offEl.style.opacity=.5;
+          onEl.onclick=offEl.onclick=()=>toast('当前浏览器不支持鼠标手势设置');
+        }
+        sw.checked=!!g.on; paint();
+      }).catch(()=>{});
     });
   $('#stCancel').onclick = closeDialog;
   // 外部工具路径的「浏览」：选一个 exe
@@ -4824,6 +8187,32 @@ function openSettings(){
       if(d && d.path && $('#' + i)) $('#' + i).value = d.path;
     };
   });
+  // 维护：清空缓存 / 查看日志
+  const cc = $('#clearCache');
+  if(cc) cc.onclick = async ()=>{
+    if(!confirm('清空解压缓存、缩略图和封面缓存？\n（不影响压缩包本身）')) return;
+    const d = await post('/api/cache/clear', {});
+    if(d && d.error) return toast(d.error);
+    S.coverMap = null; S.coverVer++;
+    toast('已清空缓存，释放 ' + ((d && d.freed) || '0 B'));
+    renderArchiveList();
+  };
+  const sl = $('#showLog');
+  if(sl) sl.onclick = async ()=>{
+    const d = await fetch('/api/log?lines=300').then(r=>r.json()).catch(()=>({lines:[]}));
+    const text = (d.lines || []).join('\n') || '（没有日志）';
+    dialog(`<h3>运行日志</h3>
+      <div class="body">
+        <div class="note" style="margin-bottom:8px;word-break:break-all">${esc(d.path || '_cache/app.log')}</div>
+        <pre style="max-height:52vh;overflow:auto;background:#f7f7fa;border:1px solid var(--line);
+          border-radius:8px;padding:10px;font-size:11.5px;line-height:1.6;white-space:pre-wrap">${esc(text)}</pre>
+      </div>
+      <div class="foot"><button class="fbtn" id="logClose">关闭</button></div>`, ()=>{
+        $('#logClose').onclick = closeDialog;
+      });
+  };
+  if($('#backupExport')) $('#backupExport').onclick = ()=>exportBackup();
+  if($('#backupImport')) $('#backupImport').onclick = ()=>importBackup();
   if($('#pwAdd')) $('#pwAdd').onclick = ()=>{
     const v = ($('#pwNew').value || '').trim();
     if(!v) return;
@@ -4832,11 +8221,6 @@ function openSettings(){
     renderPwList();
   };
   if($('#pwNew')) $('#pwNew').onkeydown = e=>{ if(e.key==='Enter') $('#pwAdd').click(); };
-  if($('#openEdgeSettings')) $('#openEdgeSettings').onclick = async ()=>{
-    const d = await post('/api/browser_settings', {});
-    if(d && d.error) return alert(d.error);
-    toast('已打开 Edge 设置，关掉「鼠标手势」后回到工具即可');
-  };
   $('#addRoot').onclick = ()=>{ roots.push(''); renderRootRows(roots); };
   $('#addOpener').onclick = ()=>{
     syncOpRows();
@@ -4882,19 +8266,23 @@ function openSettings(){
 }
 $('#settingsBtn').onclick = openSettings;
 
-/* 标题右键：刷新 / 退出程序（退出会真的结束进程，不只是关页面） */
-$('#brandBtn').onclick = ()=>location.reload();
-$('#brandBtn').oncontextmenu = ev=>{
+/* 标题刷新/退出：只有图标和文字点击生效，品牌区空白处不响应 */
+function brandMenu(ev){
   ev.preventDefault();
   showCtx(ev, [
     {icon:'', label:'刷新页面', run:()=>location.reload()},
+    ...(((S.undo||[]).length) ? [{icon:'', label:'撤销上一步'+(UNDO_LABEL[(S.undo[S.undo.length-1]||{}).kind]||''), run:()=>undoLastMove()}] : []),
     '-',
     {icon:'', label:'退出程序', danger:true, run:()=>{
       post('/api/quit', {}).catch(()=>{});
       document.body.innerHTML = '<div class="empty">程序已退出，窗口可以关掉了</div>';
     }},
   ]);
-};
+}
+$$('#brandBtn .logo, #brandBtn h1').forEach(el=>{
+  el.onclick = ()=>location.reload();
+  el.oncontextmenu = brandMenu;
+});
 
 /* 视口第一颗按钮：配了外部程序就用它，没配的 pmx 退回 PMXEditor */
 function refreshExtButton(){
@@ -5001,18 +8389,191 @@ function browseDir(start, cb){
 }
 
 /* ===================== 工具栏 ===================== */
+/* 全库包内文件名搜索：点击命中项直接打开对应压缩包并高亮包内文件 */
+async function loadInnerHits(q){
+  const dst = $('#content');
+  if(!q){ renderArchiveList(); return; }
+  dst.innerHTML = '<div class="empty"><div class="spin"></div>正在搜索包内文件…</div>';
+  try{
+    const d = await fetch('/api/search_inner?q='+enc(q)).then(r=>r.json());
+    if(d.warming){
+      setTimeout(()=>{ if($('#q').value.trim().toLowerCase()===q) loadInnerHits(q); }, 1500);
+      return;
+    }
+    S.innerHits = d.hits || [];
+    renderInnerHits(q);
+  }catch(e){ dst.innerHTML = '<div class="err">搜索失败</div>'; }
+}
+function renderInnerHits(q){
+  const dst = $('#content');
+  const hits = S.innerHits || [];
+  // 「含包内」是扩大搜索范围：压缩包名和包内文件名都查
+  const nameHits = (S.archives||[]).filter(a=>archiveHitQ(a,q)).slice(0,200);
+  const total = hits.length + nameHits.length;
+  $('#crumb').innerHTML = `<b>搜索：${esc(q)}</b><span class="crumb-n">${total} 个压缩包</span>`;
+  if(!total){ dst.innerHTML = '<div class="empty">没有找到匹配的压缩包或包内文件</div>'; return; }
+  let h = '';
+  if(nameHits.length){
+    h += '<div class="vlabel" style="margin:6px 0">压缩包名称匹配</div><div class="grid">';
+    for(const a of nameHits){
+      h += `<div class="card" data-archive="${esc(a.path)}">
+        <div class="box"><span class="ext">${esc(a.badge||'')}</span>${coverBox(a.path)}</div>
+        <div class="info"><div class="fn" title="${esc(a.path)}">${highlightQ(a.name,q)}</div>
+          <div class="fs"><span class="tag">压缩包</span><span title="${esc(a.dir||'')}">${esc(a.dir||'')}</span></div></div></div>`;
+    }
+    h += '</div>';
+  }
+  if(hits.length){
+    h += '<div class="vlabel" style="margin:12px 0 6px">包内文件匹配</div><div class="grid">';
+    for(const it of hits){
+      const arc = S.archives.find(a=>a.path===it.archive);
+      h += `<div class="card" data-inner="${esc(it.archive)}" data-innerpath="${esc(it.inner)}">
+        <div class="box"><span class="ext">${esc((it.name.split('.').pop()||'FILE').toUpperCase())}</span></div>
+        <div class="info"><div class="fn" title="${esc(it.inner)}">${highlightQ(it.name, q)}</div>
+          <div class="fs"><span class="tag">包内</span><span title="${esc(it.archive)}">${esc(arc?arc.name:it.archive.split('/').pop())}</span></div></div></div>`;
+    }
+    h += '</div>';
+  }
+  dst.innerHTML = h;
+  $$all(dst, '[data-archive]').forEach(el=>{
+    el.onclick = ev=>{ if(S.batch && S.batch.on) batchClick(ev, el.dataset.archive); else openArchive(el.dataset.archive); };
+    el.oncontextmenu = ev=>{ ev.preventDefault(); archiveMenu(ev, el.dataset.archive); };
+  });
+  $$all(dst, '[data-inner]').forEach(el=>{
+    el.onclick = async ()=>{
+      const arc = el.dataset.inner, inner = el.dataset.innerpath;
+      await openArchive(arc);
+      // 打开后高亮并滚动到命中的包内文件
+      const f = $$all($('#content'), '[data-file]').find(x=>x.dataset.file===inner);
+      if(f){ S.kb = inner; kbPaint(); }
+    };
+  });
+}
+
 $('#q').oninput = ()=>{
+  const q = $('#q');
+  const text = q.value.trim().toLowerCase();
+  const hadFocus = document.activeElement === q;
+  let caret = null;
+  try{ caret = q.selectionStart; }catch(e){}
   clearTimeout(window.__qt);
   window.__qt = setTimeout(()=>{
+    // 包内文件名搜索：走专门的索引接口
+    if(S.innerMode){ loadInnerHits(text); return; }
+    // 主列表搜索：全局匹配并自动定位到命中目录分组；清空后恢复原选中
+    if(!S.cur){
+      if(text){
+        if(!S.searchGlobal){ S.selBeforeSearch = S.sel; S.searchGlobal = true; }
+        locateSearchSelection(text);
+      }else endGlobalSearch();
+    }
+    S.page = 1;
     renderNav();
     if(S.cur) renderFiles(); else renderArchiveList();
+    // 防抖期间若重绘让焦点掉到空白页，补回搜索框；用户已点去别处则不抢焦点
+    if(hadFocus && (document.activeElement === document.body || document.activeElement === document.documentElement)){
+      try{ q.focus({preventScroll:true}); if(caret != null) q.setSelectionRange(caret, caret); }
+      catch(e){ try{ q.focus(); }catch(e2){} }
+    }
   }, 220);
 };
-$$('[data-filter]').forEach(b=>b.onclick = ()=>{
-  S.filter = b.dataset.filter;
+$('#q').onkeydown = ev=>{
+  if(ev.key === 'Enter'){
+    const text = $('#q').value.trim();
+    if(text) pushQHistory(text);
+  }
+};
+$('#q').onblur = ()=>{ const text = $('#q').value.trim(); if(text) pushQHistory(text); };
+$('#innerBtn').onclick = ev=>{
+  if(ev) ev.stopPropagation();
+  S.innerMode = !S.innerMode;
+  $('#innerBtn').classList.toggle('on', S.innerMode);
+  const q = $('#q');
+  if(q){ q.value = ''; q.placeholder = S.innerMode ? '搜索名称与包内文件…' : '搜索压缩包…'; }
+  hideHist();
+  if(!S.innerMode){ S.innerHits = []; endGlobalSearch(); renderArchiveList(); }
+  else $('#crumb').innerHTML = '<b>搜索名称与包内</b>';
+  renderNav();
+};
+/* 搜索历史：点箭头展开；点条目填入搜索；点 ✕ 删除单条；点外侧只收起，不重绘视图 */
+if($('#histArrow')) $('#histArrow').onclick = ev=>{
+  ev.stopPropagation();
+  const p = $('#histPanel');
+  if(p && !p.classList.contains('hide')) hideHist();
+  else showHist($('#histArrow'));
+};
+if($('#q')) $('#q').addEventListener('focus', ()=>hideHist());
+if($('#histPanel')){
+  $('#histPanel').onclick = ev=>{
+    ev.stopPropagation();
+    const del = ev.target.closest('[data-hdel]');
+    if(del){
+      const v = del.dataset.hdel;
+      S.qHistory = (S.qHistory||[]).filter(x=>x!==v);
+      try{ localStorage.setItem('zt_qhistory', JSON.stringify(S.qHistory)); }catch(e){}
+      renderQHistory();
+      return;
+    }
+    const item = ev.target.closest('[data-hist]');
+    if(item){
+      const q = $('#q');
+      q.value = item.dataset.hist;
+      hideHist();
+      q.focus();
+      q.dispatchEvent(new Event('input', {bubbles:true}));
+    }
+  };
+}
+document.addEventListener('click', ()=>hideHist());
+/* 分栏面板：点击切换、Ctrl 加选、Shift 首尾多选 */
+/* 分栏面板：DOM 只建一次，之后只切 class；普通/Ctrl/Shift 多选，避免焦点被抢 */
+let _secBuilt = false;
+function paintSecPanel(){
+  const sel = S.secs || new Set();
+  $$('#secList [data-sec-k]').forEach(x=>{
+    const k = x.dataset.secK;
+    x.classList.toggle('on', k==='' ? !sel.size : sel.has(k));
+  });
+}
+function renderSecPanel(){
+  const box = document.getElementById('secList');
+  if(!box) return;
+  if(!_secBuilt){
+    const defs = [{key:'', name:'全部'}].concat(SECTIONS.map(s=>({key:s.key, name:s.name})));
+    box.innerHTML = defs.map(d=>`<button class="fbtn tgchip" data-sec-k="${d.key}">${esc(d.name)}</button>`).join('');
+    _secBuilt = true;
+  }
+  paintSecPanel();
+}
+$('#secList').addEventListener('click', ev=>{
+  const b = ev.target.closest('[data-sec-k]'); if(!b) return;
+  ev.stopPropagation();
+  const k = b.dataset.secK;
+  if(!S.secs) S.secs = new Set();
+  const keys = SECTIONS.map(s=>s.key);
+  if(k === ''){ S.secs.clear(); S.secAnchor = null; }
+  else S.secAnchor = multiPick(ev, k, keys, S.secs, S.secAnchor);
   syncFilterBtns();
+  paintSecPanel();
   if(S.cur){ renderFiles(); $('#content').scrollTop = 0; }
 });
+$('#secBtn').onclick = ev=>{
+  ev.stopPropagation();
+  const p = $('#secPanel');
+  const btn = ev.currentTarget;
+  if(!p.classList.contains('hide')){ p.classList.add('hide'); return; }
+  renderSecPanel();
+  p.classList.remove('hide');
+  const r = btn.getBoundingClientRect(), pr = p.getBoundingClientRect();
+  let left = r.left;
+  if(left + pr.width > innerWidth - 8) left = Math.max(8, innerWidth - pr.width - 8);
+  let top = r.bottom + 6;
+  if(top + pr.height > innerHeight - 8) top = Math.max(8, r.top - pr.height - 6);
+  p.style.left = left + 'px';
+  p.style.top = top + 'px';
+};
+$('#secPanel').onclick = ev=>ev.stopPropagation();
+document.addEventListener('click', ()=>{ const p = $('#secPanel'); if(p) p.classList.add('hide'); });
 $('#foldAll').onclick = ()=>{
   const anyOpen = SECTIONS.some(s=>!S.foldSec[s.key]);
   SECTIONS.forEach(s=>{ S.foldSec[s.key] = anyOpen; });
@@ -5024,12 +8585,13 @@ $('#cmodeBtn').onclick = ()=>{
   $('#cmodeBtn').textContent = S.contentMode==='split' ? '堆叠分栏' : '左右铺开';
   if(S.cur) renderFiles(); else renderArchiveList();
 };
+$('#sortSel').onchange = e=>{ S.sort = e.target.value; S.page = 1; saveUI(); if(S.cur) renderFiles(); else renderArchiveList(); };
 $('#viewBtn').onclick = ()=>{
   S.viewMode = S.viewMode==='grid'?'rows':'grid';
   $('#viewBtn').textContent = S.viewMode==='grid'?'列表':'网格';
   if(S.cur) renderFiles(); else renderArchiveList();
 };
-$('#trashBtn').onclick = ()=>post('/api/trash/open', {});
+$('#trashBtn').onclick = ()=>openTrashManager();
 function setSideCollapsed(c){
   document.body.classList.toggle('side-collapsed', c);
   $('#sidebar').classList.toggle('hide', c);
@@ -5047,6 +8609,55 @@ $('#sideTab').onclick = ()=> setSideCollapsed(!document.body.classList.contains(
 $('#viewTab').onclick = ()=> setViewCollapsed(!document.body.classList.contains('view-collapsed'));
 $('#toggleViewer').onclick = ()=> setViewCollapsed(!document.body.classList.contains('view-collapsed'));
 $('#vClose').onclick = ()=> setViewCollapsed(true);
+bindFootTabs();
+bindVMDrop();
+
+/* ---------- 视图导航球（Blender 式快速回正）---------- */
+function camLockedByMotion(){ return !!(VM && VM.camAction && VM.playing); }
+function vmNavRefresh(){
+  const ball = document.getElementById('vNavBall');
+  const btn = document.getElementById('vAxis');
+  if(!ball) return;
+  ball.classList.toggle('locked', camLockedByMotion());
+  if(btn) btn.classList.toggle('on', ball.classList.contains('show'));
+}
+/* 围绕 CTL.target 把相机摆到指定方向；dir 是相机相对目标的方向，up 是上方向 */
+function vmSetAxisView(dir, up){
+  if(camLockedByMotion()) return;          // 播放带镜头时不生效
+  if(!CAM || !CTL) return;
+  const t = CTL.target.clone();
+  let dist = CAM.position.distanceTo(t);
+  if(!isFinite(dist) || dist < 0.01) dist = 30;
+  const d = new THREE.Vector3(dir[0], dir[1], dir[2]).normalize().multiplyScalar(dist);
+  CAM.position.copy(t).add(d);
+  CAM.up.set(up[0], up[1], up[2]);
+  CAM.lookAt(t);
+  CTL.target.copy(t);
+  CTL.update();
+  markDirty();
+}
+(function bindNavBall(){
+  const btn = document.getElementById('vAxis');
+  const ball = document.getElementById('vNavBall');
+  if(!btn || !ball) return;
+  btn.onclick = ()=>{ ball.classList.toggle('show'); vmNavRefresh(); };
+  ball.querySelectorAll('button[data-view]').forEach(b=>{
+    b.onclick = ()=>{
+      if(camLockedByMotion()) return;
+      const v = b.dataset.view;
+      if(v === 'fit'){ try{ vmFitAll(); }catch(e){} return; }
+      const ISO = 0.82;
+      const F = {
+        front:[0,0,1], back:[0,0,-1], left:[-1,0,0], right:[1,0,0],
+        top:[0,1,0], bottom:[0,-1,0], home:[ISO,ISO,ISO], iso2:[-ISO,ISO,ISO],
+      }[v];
+      if(!F) return;
+      const up = (v === 'top') ? [0,0,-1] : (v === 'bottom') ? [0,0,1] : [0,1,0];
+      vmSetAxisView(F, up);
+    };
+  });
+  vmNavRefresh();
+})();
 
 /* ---------- 拖拽调整三个视口宽度 ---------- */
 function applyPaneSizes(side, view){
@@ -5063,6 +8674,44 @@ function loadPaneSizes(){
       applyPaneSizes(d.side, d.view);
     }
   }catch(e){}
+}
+function applyFootHeight(h){
+  const max = Math.max(160, window.innerHeight - 180);
+  const v = Math.max(90, Math.min(max, Math.round(h)));
+  document.documentElement.style.setProperty('--foot-h', v + 'px');
+  try{ localStorage.setItem('zipview.footH', String(v)); }catch(e){}
+  if(typeof resizeGL === 'function') setTimeout(resizeGL, 20);
+}
+function loadFootHeight(){
+  const h = parseInt(localStorage.getItem('zipview.footH') || '', 10);
+  if(h) applyFootHeight(h);
+}
+function bindFootSplitter(){
+  const el = $('#splitFoot'); if(!el) return;
+  el.addEventListener('pointerdown', ev=>{
+    ev.preventDefault();
+    el.setPointerCapture(ev.pointerId);
+    el.classList.add('drag');
+    document.body.classList.add('resizing');
+    const startY = ev.clientY;
+    const cur = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--foot-h')) || 260;
+    const onMove = e=>{
+      const h = cur - (e.clientY - startY);
+      const max = Math.max(160, window.innerHeight - 180);
+      document.documentElement.style.setProperty('--foot-h', Math.max(90, Math.min(max, h)) + 'px');
+      if(typeof resizeGL === 'function') resizeGL();
+    };
+    const onUp = ()=>{
+      el.classList.remove('drag');
+      document.body.classList.remove('resizing');
+      try{ el.releasePointerCapture(ev.pointerId); }catch(_){}
+      el.removeEventListener('pointermove', onMove);
+      el.removeEventListener('pointerup', onUp);
+      applyFootHeight(parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--foot-h')) || 260);
+    };
+    el.addEventListener('pointermove', onMove);
+    el.addEventListener('pointerup', onUp);
+  });
 }
 function bindSplitter(el, side){
   el.addEventListener('pointerdown', ev=>{
@@ -5098,6 +8747,8 @@ function bindSplitter(el, side){
 }
 bindSplitter($('#splitSide'), true);
 bindSplitter($('#splitView'), false);
+bindFootSplitter();
+loadFootHeight();
 loadPaneSizes();
 /* 截图：先显示虚线框（提示会截到哪里），确认后才真正截 */
 $('#vShot').onclick = ()=>{
@@ -5115,10 +8766,7 @@ if($('#shotOk')) $('#shotOk').onclick = async ()=>{
     try{
       const d = await post('/api/cover/save', {path:S.cur, password:S.pwd, png});
       if(d.ok){
-        S.coverVer++;
-        // 左侧网格和文件列表都要重画：封面 URL 带 v=，重画后浏览器才会重新取图
-        renderArchiveList();
-        if(S.cur) renderFiles();
+        afterCoverSaved();
         toast(`封面已保存到包内 ${S.coverFolder}/ 文件夹`);
         return;
       }
@@ -5145,6 +8793,76 @@ function toast(msg){
   t._timer = setTimeout(()=>{ t.style.opacity = '0'; }, 2600);
 }
 
+/* ---------- 键盘导航：方向键选卡片，Enter 打开，F2 重命名，Delete 删除 ---------- */
+function kbCards(){
+  const root = $('#paneRight') && S.contentMode === 'split' ? $('#paneRight') : $('#content');
+  if(!root) return [];
+  let cards = [...root.querySelectorAll('[data-archive],[data-file]')];
+  // 批量模式下也用同一批卡片
+  if(!cards.length) cards = [...document.querySelectorAll('#content [data-archive],[data-file]')];
+  return cards;
+}
+function kbCurrent(){
+  if(!S.kb) return -1;
+  return kbCards().findIndex(el=>(el.dataset.archive||el.dataset.file) === S.kb);
+}
+function kbPaint(){
+  const cards = kbCards();
+  cards.forEach(el=>{
+    const p = el.dataset.archive || el.dataset.file;
+    el.classList.toggle('kb', !!S.kb && p === S.kb);
+  });
+  const i = kbCurrent();
+  if(i >= 0 && cards[i].scrollIntoView){
+    try{ cards[i].scrollIntoView({block:'nearest'}); }catch(e){}
+  }
+}
+function kbMove(step){
+  const cards = kbCards();
+  if(!cards.length) return;
+  let i = kbCurrent();
+  i = i < 0 ? (step > 0 ? 0 : cards.length - 1) : Math.max(0, Math.min(cards.length - 1, i + step));
+  S.kb = cards[i].dataset.archive || cards[i].dataset.file;
+  kbPaint();
+}
+function kbPath(){
+  const cards = kbCards();
+  const i = kbCurrent();
+  if(i < 0) return null;
+  const el = cards[i];
+  // 文件卡片在压缩包里，重命名/删除要落到真实文件：散文件用所属包路径
+  return {path: el.dataset.archive || el.dataset.file, isFile: !!el.dataset.file};
+}
+function kbActivate(){
+  const k = kbPath(); if(!k) return;
+  if(k.isFile) onFile(k.path);
+  else{
+    if(S.batch && S.batch.on) batchClick({shiftKey:false,ctrlKey:false,metaKey:false}, k.path);
+    else openArchive(k.path);
+  }
+}
+async function kbRename(){
+  const k = kbPath(); if(!k) return;
+  if(k.isFile){
+    // 包内文件不能直接改（要先解压），只支持散文件（它自己就是 S.cur）
+    const a = S.archives.find(x=>x.path===S.cur);
+    if(a && a.is_loose) askRename(S.cur);
+    else toast('压缩包内的文件不能直接重命名');
+    return;
+  }
+  askRename(k.path);
+}
+function kbTrash(){
+  const k = kbPath(); if(!k) return;
+  if(k.isFile){
+    const a = S.archives.find(x=>x.path===S.cur);
+    if(a && a.is_loose) askTrash(S.cur);
+    else toast('压缩包内的文件不能直接删除');
+    return;
+  }
+  askTrash(k.path);
+}
+
 document.addEventListener('keydown', e=>{
   if($('#lb').classList.contains('on')){
     if(e.key==='Escape') closeLb();
@@ -5152,18 +8870,106 @@ document.addEventListener('keydown', e=>{
     if(e.key==='ArrowRight') stepLb(1);
     return;
   }
-  if(e.key==='Escape'){ closeDialog(); ctx.classList.remove('on'); }
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test((e.target.tagName || ''));
+
+  // F5：刷新列表
+  if(e.key === 'F5'){
+    e.preventDefault();
+    if(S.cur) renderFiles(); else renderArchiveList();
+    renderNav(); renderStat();
+    toast('已刷新');
+    return;
+  }
+  // Ctrl+F：跳到搜索框
+  if((e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F')){
+    e.preventDefault();
+    const q = $('#q');
+    if(q){ q.focus(); q.select(); }
+    return;
+  }
+  // Ctrl+Z：撤销上一步（移动/重命名/删除/复制）
+  if((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z') && !typing && !$('#mask').classList.contains('on')){
+    e.preventDefault(); undoLastMove(); return;
+  }
+  // Ctrl+C / Ctrl+X / Ctrl+V：文件剪贴板（输入框里交给浏览器原生）
+  if((e.ctrlKey || e.metaKey) && !typing && !$('#mask').classList.contains('on')){
+    const k = (e.key||'').toLowerCase();
+    if(k==='c'){ e.preventDefault(); clipTake('copy'); return; }
+    if(k==='x'){ e.preventDefault(); clipTake('cut'); return; }
+    if(k==='v'){ e.preventDefault(); clipPaste(); return; }
+  }
+  // Ctrl+A：批量模式下全选当前列表（输入框里交给浏览器原生）
+  if((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A') && !typing && S.batch && S.batch.on){
+    e.preventDefault();
+    S.batch.order.forEach(p=>S.batch.sel.add(p));
+    batchPaint();
+    return;
+  }
+  // Escape 要在弹窗/输入判断之前：对话框、右键菜单、搜索框都靠它收起
+  if(e.key==='Escape'){
+    closeDialog(); ctx.classList.remove('on');
+    const sp = $('#secPanel'); if(sp) sp.classList.add('hide');
+    // 搜索框有内容时，Esc 先清空搜索
+    const q = $('#q');
+    if(q && q.value){
+      q.value = '';
+      endGlobalSearch();
+      if(S.cur) renderFiles(); else renderArchiveList();
+      renderNav();
+    }
+    return;
+  }
+  // 弹窗/输入时不抢快捷键
+  const dlgOpen = $('#mask').classList.contains('on');
+  if(dlgOpen || typing) return;
+
+  if(e.key === 'ArrowDown' || e.key === 'ArrowUp'){
+    e.preventDefault(); kbMove(e.key === 'ArrowDown' ? 1 : -1); return;
+  }
+  if(e.key === 'ArrowLeft' || e.key === 'ArrowRight'){
+    // 网格视图左右也按一行移动（列数由 CSS 决定，简单按页大小的一半估算）
+    e.preventDefault(); kbMove(e.key === 'ArrowRight' ? Math.max(1, Math.round((S.pageSize||60)/10)) : -Math.max(1, Math.round((S.pageSize||60)/10))); return;
+  }
+  if(e.key === 'Enter'){
+    if(kbCurrent() >= 0){ e.preventDefault(); kbActivate(); }
+    return;
+  }
+  if(e.key === 'F2'){
+    if(kbCurrent() >= 0){ e.preventDefault(); kbRename(); }
+    return;
+  }
+  if(e.key === 'Delete'){
+    if(kbCurrent() >= 0){ e.preventDefault(); kbTrash(); }
+    return;
+  }
+  if(e.key === 'Backspace'){
+    e.preventDefault();
+    if(S.batch && S.batch.on) batchExit();
+    else if(S.cur) backToList();
+    return;
+  }
 });
 
 /* ===================== 筛选面板 ===================== */
-S.flt = {enc:'all', cov:'all'};
+S.flt = {enc:'all', cov:'all', kinds:new Set(), kindAnchor:null};
 S.coverMap = null;
 
-async function loadCovers(){
-  if(S.coverMap) return S.coverMap;
-  toast('正在统计预览图…');
-  try{ const d = await fetch('/api/covers').then(r=>r.json()); S.coverMap = d.map || {}; }
-  catch(e){ S.coverMap = {}; }
+async function loadCovers(silent){
+  if(S.coverMap && !S.coverWarming) return S.coverMap;
+  if(!silent && !S.coverWarming) toast('正在统计预览图…');
+  try{
+    const d = await fetch('/api/covers').then(r=>r.json());
+    S.coverMap = d.map || {};
+    S.coverWarming = !!d.warming;
+    if(S.coverWarming){
+      clearTimeout(window.__coverPoll);
+      window.__coverPoll = setTimeout(async()=>{
+        S.coverWarming = false; S.coverMap = null;
+        await loadCovers(true);
+        if(!S.cur) renderArchiveList();
+      }, 1500);
+    }
+  }catch(e){ S.coverMap = {}; S.coverWarming = false; }
   return S.coverMap;
 }
 
@@ -5173,6 +8979,7 @@ $('#filterBtn').onclick = ev=>{
   const btn = ev.currentTarget;
   if(!p.classList.contains('hide')){ p.classList.add('hide'); return; }
   p.classList.remove('hide');
+  renderTagFilter();
   // 浮层贴着按钮往右展开；右边放不下就翻到按钮左边，上下再夹进窗口
   const r = btn.getBoundingClientRect();
   const pr = p.getBoundingClientRect();
@@ -5185,14 +8992,31 @@ $('#filterBtn').onclick = ev=>{
 };
 $('#filterPanel').onclick = ev=>ev.stopPropagation();
 document.addEventListener('click', ()=>{ const p=$('#filterPanel'); if(p) p.classList.add('hide'); });
-$$('#filterPanel [data-fenc]').forEach(b=>b.onclick=()=>{
-  S.flt.enc = b.dataset.fenc;
-  $$('#filterPanel [data-fenc]').forEach(x=>x.classList.toggle('on', x===b));
+const KIND_KEYS = ['archive','model','motion','image','audio','other'];
+function paintKindFilter(){
+  $$('#filterPanel [data-fkind]').forEach(x=>{
+    const k = x.dataset.fkind;
+    x.classList.toggle('on', k==='all' ? !S.flt.kinds.size : S.flt.kinds.has(k));
+  });
+}
+$$('#filterPanel [data-fkind]').forEach(b=>b.onclick=ev=>{
+  ev.stopPropagation();
+  const k = b.dataset.fkind;
+  if(k==='all'){ S.flt.kinds.clear(); S.flt.kindAnchor = null; }
+  else S.flt.kindAnchor = multiPick(ev, k, KIND_KEYS, S.flt.kinds, S.flt.kindAnchor);
+  S.page = 1;
+  paintKindFilter();
   renderArchiveList();
 });
+function paintEncCov(){
+  $$('#filterPanel [data-fenc]').forEach(x=>x.classList.toggle('on', x.dataset.fenc===S.flt.enc));
+  $$('#filterPanel [data-fcov]').forEach(x=>x.classList.toggle('on', x.dataset.fcov===S.flt.cov));
+}
+$$('#filterPanel [data-fenc]').forEach(b=>b.onclick=()=>{
+  S.flt.enc = b.dataset.fenc; S.page = 1; paintEncCov(); renderArchiveList();
+});
 $$('#filterPanel [data-fcov]').forEach(b=>b.onclick=()=>{
-  S.flt.cov = b.dataset.fcov;
-  $$('#filterPanel [data-fcov]').forEach(x=>x.classList.toggle('on', x===b));
+  S.flt.cov = b.dataset.fcov; S.page = 1; paintEncCov();
   if(S.flt.cov !== 'all' && !S.coverMap) loadCovers().then(()=>renderArchiveList());
   else renderArchiveList();
 });
@@ -5271,13 +9095,22 @@ $('#batchBar').onclick = ev=>{
   if(!b) return;
   const act = b.dataset.b;
   const sel = [...S.batch.sel];
-  if(act==='exit'){ batchExit(); return; }
+  if(act==='exit'){ S.dup=null; if($('#dupBtn')) $('#dupBtn').classList.remove('on'); batchExit(); return; }
   if(act==='all'){ S.batch.order.forEach(p=>S.batch.sel.add(p)); }
   else if(act==='inv'){ S.batch.order.forEach(p=>{ if(S.batch.sel.has(p)) S.batch.sel.delete(p); else S.batch.sel.add(p); }); }
   else if(act==='none'){ S.batch.sel.clear(); S.batch.anchor = null; }
+  else if(act==='rename'){ if(!sel.length) return toast('先选几个'); batchRename(sel); return; }
+  else if(act==='tagadd'){ if(!sel.length) return toast('先选几个'); batchTags(sel, true); return; }
   else if(act==='move'){ if(!sel.length) return toast('先选几个'); batchMove(sel); return; }
+  else if(act==='copy'){ if(!sel.length) return toast('先选几个'); pickFolder('复制选中项到…', dst=>batchCopyTo(dst), null, '复制到这里'); return; }
   else if(act==='cover'){ if(!sel.length) return toast('先选几个'); batchCovers(sel); return; }
   else if(act==='delcover'){ if(!sel.length) return toast('先选几个'); batchDelCovers(sel); return; }
+  else if(act==='extract'){
+    if(!sel.length) return toast('先选几个');
+    askBatchExtract(sel);
+    return;
+  }
+  else if(act==='trash'){ if(!sel.length) return toast('先选几个'); batchTrash(sel); return; }
   batchPaint();
 };
 
@@ -5318,7 +9151,7 @@ function metaTree(){
 
 /* 可逐级进入的目录选择器：点文件夹往下钻，点「移动到这里」确认当前层 */
 /* 可展开的目录树选择器（像左侧分组那样一层层展开，而不是一层层钻） */
-function pickFolder(title, cb, excludeDir){
+function pickFolder(title, cb, excludeDir, okLabel, initialDir){
   const roots = metaTree();
   const bad = (p)=>{
     if(!excludeDir) return false;
@@ -5326,14 +9159,29 @@ function pickFolder(title, cb, excludeDir){
     return a === b || a.startsWith(b + '\\');
   };
   const expanded = new Set();          // 展开的目录
-  let selected = '';                   // 当前选中的目录
+  let selected = initialDir || '';     // 当前选中的目录
+  const normDir = s => String(s || '').replace(/\//g, '\\');
+  const selectedKey = normDir(selected);
+  // 预选目录时把它的各级父目录展开，并滚到可见位置
+  if(selected){
+    const trail = [];
+    const findDir = nodes=>{
+      for(const n of nodes){
+        if(normDir(n.dir) === selectedKey){ trail.push(n.dir); return true; }
+        if(findDir(n.children || [])){ trail.push(n.dir); return true; }
+      }
+      return false;
+    };
+    findDir(roots);
+    trail.forEach(d=>expanded.add(d));
+  }
 
   const renderTree = (nodes, depth)=>{
     let h = '';
     for(const n of nodes){
       if(bad(n.dir)) continue;
       const exp = expanded.has(n.dir);
-      const sel = selected === n.dir;
+      const sel = normDir(n.dir) === selectedKey;
       h += `<div class="ditem pktree ${sel?'on':''}" data-dir="${esc(n.dir)}"
               style="padding-left:${8 + depth*15}px">
               <span class="chev" data-chev="${esc(n.dir)}">${n.children.length ? (exp?'▾':'▸') : ''}</span>
@@ -5352,9 +9200,11 @@ function pickFolder(title, cb, excludeDir){
       <div class="note">点箭头展开子文件夹，点文件夹名选中；最上层就是管理目录。</div>
     </div><div class="foot">
       <button class="fbtn" id="pkCancel">取消</button>
-      <button class="fbtn solid" id="pkOk"${selected ? '' : ' disabled'}>移动到这里</button>
-    </div>`, ()=>{
+      <button class="fbtn solid" id="pkOk"${selected ? '' : ' disabled'}>${esc(okLabel || '移动到这里')}</button>
+    </div>`,     ()=>{
       $('#pkCancel').onclick = closeDialog;
+      const on = $('#pkList .ditem.on');
+      if(on && on.scrollIntoView) try{ on.scrollIntoView({block:'center'}); }catch(e){}
       const ok = $('#pkOk');
       if(ok) ok.onclick = ()=>{ if(!selected) return; const d = selected; closeDialog(); cb(d); };
       $$('#dlg [data-chev]').forEach(el=>el.onclick = ev=>{
@@ -5378,38 +9228,376 @@ function pickFolder(title, cb, excludeDir){
 }
 
 function batchMove(paths){
-  pickFolder(`移动 ${paths.length} 个到…`, dst=>doBatchMove(paths, dst));
+  pickFolder(`移动 ${paths.length} 个到…`, dst=>doBatchMove(paths, dst), null, '移动到这里');
 }
 
 async function doBatchMove(paths, dst){
-  let overwrite = null, ok = 0, skip = 0;
-  for(const p of paths){
-    let d = await post('/api/fs/move', {src:p, dst_dir:dst});
+  let overwrite = null, ok = 0, skip = 0, gotMeta = false;
+  S.taskCancel = false; taskBegin('移动', paths.length);
+  // 只有最后一个成功的移动需要全库 meta；中间步骤跳过重扫，避免 N 个文件 × 0.3s
+  const last = paths.length - 1;
+  for(let i=0;i<paths.length;i++){
+    if(S.taskCancel) break;
+    const p = paths[i];
+    const noMeta = i !== last;
+    let d = await post('/api/fs/move', {src:p, dst_dir:dst, no_meta:noMeta});
     if(d.conflict){
       if(overwrite === null){
         overwrite = await new Promise(res=>askOverwrite(d.name, res));
       }
       if(!overwrite){ skip++; continue; }
-      d = await post('/api/fs/move', {src:p, dst_dir:dst, overwrite:true});
+      d = await post('/api/fs/move', {src:p, dst_dir:dst, overwrite:true, no_meta:noMeta});
     }
     if(d.error){ toast(d.error); }
-    else if(d.meta){ S.meta = d.meta; S.archives = d.meta.archives; ok++; }
+    else{
+      ok++;
+      if(d.path) pushUndo('move', p, d.path);
+      if(d.meta){ S.meta = d.meta; S.archives = d.meta.archives; gotMeta = true; }
+    }
+    taskStep(i+1, paths.length, '移动');
   }
+  taskEnd();
+  // 兜底：最后一步若被跳过（冲突/失败）没拿到 meta，主动拉一次保证界面最新
+  if(ok && !gotMeta) await loadMeta();
   S.coverMap = null;
   toast(`移动完成：${ok} 个` + (skip ? `，跳过 ${skip} 个` : ''));
-  batchExit(); renderNav(); renderStat();
+  batchExit(); renderNav(); renderStat(); renderArchiveList();
 }
 
 async function batchDelCovers(paths){
-  let n = 0;
-  for(const p of paths){
+  let n = 0; S.taskCancel=false; taskBegin('删除预览图', paths.length);
+  for(let i=0;i<paths.length;i++){
+    if(S.taskCancel) break;
+    const p=paths[i];
     const d = await post('/api/cover/delete', {path:p, password:S.pwd});
     if(d.error){ toast(d.error); continue; }
     if(d.removed) n++;
+    taskStep(i+1, paths.length, '删除预览图');
   }
+  taskEnd();
   S.coverMap = null; S.coverVer++;
   toast(`已删除 ${n} 张预览图`);
   batchExit();
+}
+
+/* ===================== 新增：进度 / 重复 / 批量工具 ===================== */
+function fmtBytes(n){
+  n = Number(n) || 0;
+  if(n < 1024) return n + ' B';
+  const u = ['KB','MB','GB','TB']; let i = -1;
+  do{ n /= 1024; i++; }while(n >= 1024 && i < u.length - 1);
+  return n.toFixed(n >= 10 ? 0 : 1) + ' ' + u[i];
+}
+function taskBegin(label, total){
+  S.taskCancel = false;
+  const bar = $('#taskBar'); if(!bar) return;
+  bar.classList.remove('hide');
+  $('#taskFill').style.width = '0%';
+  $('#taskText').textContent = label + ' 0/' + total;
+}
+function taskStep(i, total, label){
+  const bar = $('#taskBar'); if(!bar || bar.classList.contains('hide')) return;
+  $('#taskFill').style.width = Math.round(i / Math.max(1,total) * 100) + '%';
+  $('#taskText').textContent = (label || '处理中') + ' ' + i + '/' + total;
+}
+function taskEnd(){
+  const bar = $('#taskBar'); if(!bar) return;
+  bar.classList.add('hide');
+  $('#taskFill').style.width = '0%';
+}
+if($('#taskCancel')) $('#taskCancel').onclick = ()=>{
+  S.taskCancel = true;
+  const t = $('#taskText'); if(t) t.textContent = '正在取消…';
+};
+
+function renderDupList(d, mode){
+  S.dup = {on:true, data:d, mode};
+  const root = $('#content'); if(!root) return;
+  root.classList.remove('split');
+  const pager = $('#pagerBar'); if(pager) pager.classList.add('hide');
+  $('#crumb').innerHTML = `<b>重复资源 · ${esc(String(mode||'').split(',').map(m=>m==='md5'?'MD5':m==='size'?'同大小+时间':'同名').join(' + '))}</b>
+    <span style="color:var(--text3)">${d.total} 个 · ${d.groups.length} 组 · ${fmtBytes(d.wasted)}</span>`;
+  $('#secSummary').textContent = '';
+  let h = '';
+  for(const g of d.groups){
+    h += `<div class="dirbar">${g.items.length} 个 · 可释放 ${fmtBytes(g.wasted)}</div>`;
+    h += `<div class="${S.viewMode==='grid'?'grid':''}">`;
+    for(const it of g.items){
+      h += `<div class="card ${S.batch&&S.batch.on&&S.batch.sel.has(it.path)?'sel':''}" data-archive="${esc(it.path)}" draggable="true">
+        <div class="box"><span class="ext">${esc(it.badge||'')}</span><span class="ph">◇</span><span class="ctime">${fmtDate(it.mtime)}</span></div>
+        <div class="info"><div class="fn" title="${esc(it.path)}">${esc(it.name)}</div>
+          <div class="fs"><span class="tag">重复</span><span>${esc(it.size)}</span><span>${esc(it.dir||'')}</span></div>
+        </div></div>`;
+    }
+    h += '</div>';
+  }
+  root.innerHTML = h;
+  $$all(root, '[data-archive]').forEach(el=>{
+    el.onclick = ev=>{ if(S.batch && S.batch.on) batchClick(ev, el.dataset.archive); };
+    el.oncontextmenu = ev=>{ ev.preventDefault(); archiveMenu(ev, el.dataset.archive); };
+    el.addEventListener('dragstart', ev=>{
+      S.drag = {kind:'file', path:el.dataset.archive, copy:!!(ev.ctrlKey||ev.altKey)};
+      try{ ev.dataTransfer.setData('text/plain', el.dataset.archive); }catch(e){}
+    });
+  });
+}
+function enterDupMode(d, mode){
+  S.batch.on = true;
+  S.batch.sel = new Set();
+  S.batch.anchor = null;
+  S.batch.order = d.groups.flatMap(g=>g.items.map(x=>x.path));
+  $('#batchBar').classList.remove('hide');
+  updateBatchUI();
+  renderDupList(d, mode);
+  if($('#dupBtn')) $('#dupBtn').classList.add('on');
+}
+async function runDupScan(){
+  if(!S.meta || !S.archives || !S.archives.length) return toast('先等资源列表加载完');
+  const mode = dupModeStr();
+  toast(mode.includes('md5') ? '正在计算 MD5…' : '正在扫描重复…');
+  try{
+    const d = await fetch('/api/duplicates?mode=' + enc(mode)).then(r=>r.json());
+    if(d.error) return toast(d.error);
+    if(!d.groups || !d.groups.length) return toast('没有发现重复');
+    enterDupMode(d, mode);
+    toast(`发现 ${d.groups.length} 组重复`);
+  }catch(e){ toast('扫描失败'); }
+}
+function dupModeStr(){ return [...S.dupModes].join(','); }
+if($('#dupBtn')) $('#dupBtn').onclick = ()=>{
+  if(S.dup && S.dup.on){ S.dup = null; $('#dupBtn').classList.remove('on'); batchExit(); return; }
+  runDupScan();
+};
+/* 是否重复的模式：和其他筛选组一致——普通=单选(再点取消)、Ctrl=加选/减选、Shift=首尾区间。
+   至少保留一个模式（全清时退回点击的那个）。 */
+let _dupAnchor = null;
+const DUP_KEYS = ['name','size','md5'];
+function paintDupModes(){
+  $$('[data-dupmode]').forEach(x=>x.classList.toggle('on', S.dupModes.has(x.dataset.dupmode)));
+}
+$$('[data-dupmode]').forEach(b=>b.onclick = ev=>{
+  ev.stopPropagation();
+  const k = b.dataset.dupmode;
+  _dupAnchor = multiPick(ev, k, DUP_KEYS, S.dupModes, _dupAnchor);
+  if(!S.dupModes.size) S.dupModes.add(k);   // 至少留一个模式
+  paintDupModes();
+  if(S.dup && S.dup.on) runDupScan();
+});
+
+function downloadText(name, text){
+  const blob = new Blob([text], {type:'text/plain;charset=utf-8'});
+  const url = URL.createObjectURL(blob), a = document.createElement('a');
+  a.href = url; a.download = name; document.body.appendChild(a); a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 300);
+}
+function batchRename(paths){
+  if(!paths.length) return toast('先选几个');
+  const def = '{name}_{n}';
+  const preview = t=>paths.slice(0,3).map((p,i)=>{
+    const name = p.split(/[\\/]/).filter(Boolean).pop();
+    const stem = name.replace(/\.[^.]+$/,'');
+    const ext = (name.match(/\.[^.]+$/)||[''])[0].slice(1);
+    const d = new Date();
+    return t.replace(/\{name\}/g,stem).replace(/\{n\}/g,String(i+1).padStart(2,'0'))
+            .replace(/\{date\}/g,d.toISOString().slice(0,10).replace(/-/g,'')) + (ext?'.'+ext:'');
+  }).join('\n');
+  dialog(`<h3>批量重命名</h3>
+    <div class="body"><input id="brTpl" value="${esc(def)}" spellcheck="false"><div id="brPrev" class="note"></div></div>
+    <div class="foot"><button class="fbtn" id="brCancel">取消</button><button class="fbtn solid" id="brOk">重命名 ${paths.length} 个</button></div>`,
+    ()=>{ const el=$('#brTpl'); el.focus(); el.select(); $('#brPrev').textContent=preview(el.value); el.oninput=()=>$('#brPrev').textContent=preview(el.value); });
+  $('#brCancel').onclick = closeDialog;
+  $('#brOk').onclick = async ()=>{
+    const tpl = $('#brTpl').value.trim(); if(!tpl) return;
+    let ok=0; S.taskCancel=false; taskBegin('重命名', paths.length);
+    for(let i=0;i<paths.length;i++){
+      if(S.taskCancel) break;
+      const p=paths[i], name=p.split(/[\\/]/).filter(Boolean).pop();
+      const stem=name.replace(/\.[^.]+$/,''), ext=(name.match(/\.[^.]+$/)||[''])[0].slice(1);
+      const nn=tpl.replace(/\{name\}/g,stem).replace(/\{n\}/g,String(i+1).padStart(2,'0')).replace(/\{date\}/g,new Date().toISOString().slice(0,10).replace(/-/g,''));
+      const d=await post('/api/fs/rename',{path:p,name:nn});
+      if(!d.error){ if(d.path) pushUndo('rename',p,d.path); ok++; }
+      taskStep(i+1,paths.length,'重命名');
+    }
+    taskEnd(); closeDialog(); toast(`重命名 ${ok} 个`);
+    S.dup=null; if($('#dupBtn')) $('#dupBtn').classList.remove('on');
+    batchExit(); renderNav(); renderStat(); renderArchiveList();
+  };
+}
+
+function batchTagsClear(paths){
+  if(!paths.length) return toast('先选几个');
+  (async()=>{
+    let ok=0; taskBegin('清除标签', paths.length);
+    for(let i=0;i<paths.length;i++){
+      if(S.taskCancel) break;
+      const d=await setTags(paths[i], [], true);
+      if(d && !d.error) ok++;
+      taskStep(i+1, paths.length, '清除标签');
+    }
+    taskEnd();
+    const tg=await fetch('/api/tags').then(r=>r.json()).catch(()=>({tags:{}}));
+    S.tags=tg.tags||{}; renderTagFilter(); renderArchiveList();
+    toast(`已清除 ${ok} 项的标签`);
+  })();
+}
+
+function batchTags(paths, add){
+  if(!paths.length) return toast('先选几个');
+  dialog(`<h3>${add?'添加标签':'批量标签'}</h3>
+    <div class="body"><input id="btTags" placeholder="标签用逗号分隔" spellcheck="false">
+      ${add?'<div class="note">在原有标签上追加，不会清除已有标签</div>':''}</div>
+    <div class="foot"><button class="fbtn" id="btCancel">取消</button><button class="fbtn solid" id="btOk">应用</button></div>`,
+    ()=>$('#btTags').focus());
+  $('#btCancel').onclick = closeDialog;
+  $('#btOk').onclick = async ()=>{
+    const tags=$('#btTags').value.split(/[,，]/).map(x=>x.trim()).filter(Boolean).slice(0,12);
+    if(!tags.length) return toast('先输入标签');
+    let ok=0; taskBegin(add?'添加标签':'标签', paths.length);
+    for(let i=0;i<paths.length;i++){
+      if(S.taskCancel) break;
+      let final = tags;
+      if(add){
+        const old = (S.tags && S.tags[paths[i]]) || [];
+        final = [...new Set(old.concat(tags))].slice(0,16);
+      }
+      const d=await post('/api/tags',{path:paths[i],tags:final});
+      if(d.ok) ok++;
+      taskStep(i+1,paths.length,add?'添加标签':'标签');
+    }
+    taskEnd(); closeDialog();
+    const tg=await fetch('/api/tags').then(r=>r.json()).catch(()=>({tags:{}}));
+    S.tags=tg.tags||{}; renderTagFilter(); toast(`已更新 ${ok} 个`);
+  };
+}
+
+async function batchExtract(paths, dstDir){
+  let ok=0, skip=0; S.taskCancel=false; taskBegin('解压', paths.length);
+  for(let i=0;i<paths.length;i++){
+    if(S.taskCancel) break;
+    taskStep(i+1, paths.length, '解压');
+    const a = (S.archives||[]).find(x=>x.path===paths[i]);
+    const stem = (a?a.name:paths[i].split(/[\\/]/).pop()).replace(/\.[^.]+$/,'');
+    const target = dstDir.replace(/[\\/]+$/,'') + '/' + stem;
+    try{
+      const d = await post('/api/fs/extract', {path:paths[i], target, password:S.pwd});
+      if(d.ok || d.target) ok++; else skip++;
+    }catch(e){ skip++; }
+  }
+  taskEnd();
+  await loadMeta(); renderNav(); renderArchiveList();
+  toast(`已解压 ${ok} 个` + (skip?`，跳过 ${skip} 个`:''));
+  batchExit();
+}
+
+function batchTrash(paths){
+  if(!paths.length) return toast('先选几个');
+  dialog(`<h3>删除 ${paths.length} 个</h3>
+    <div class="body"><div class="note">移到本工具的回收站，可还原。</div></div>
+    <div class="foot"><button class="fbtn" id="btcCancel">取消</button><button class="fbtn solid" id="btcOk" style="background:var(--red);border-color:var(--red)">移到回收站</button></div>`);
+  $('#btcCancel').onclick = closeDialog;
+  $('#btcOk').onclick = async ()=>{
+    taskBegin('删除', paths.length); taskStep(0, paths.length, '删除');
+    const d = await post('/api/fs/trash_batch', {paths});
+    taskStep(paths.length, paths.length, '删除');
+    taskEnd(); closeDialog();
+    if(d && d.error) return toast(d.error);
+    const done = (d && d.done) || [];
+    for(const it of done) pushUndo('trash', it.src, it.trash);
+    if(d && d.meta) applyMeta(d.meta);
+    const bad = ((d && d.failed) || []).length;
+    toast(`已删除 ${done.length} 个` + (bad?`，失败 ${bad} 个`:''));
+    S.dup=null; if($('#dupBtn')) $('#dupBtn').classList.remove('on');
+    batchExit(); renderNav(); renderStat(); renderArchiveList();
+  };
+}
+
+function locateArchive(path){
+  const a=(S.archives||[]).find(x=>x.path===path); if(!a) return;
+  const q=$('#q'); if(q) q.value='';
+  S.innerMode=false; if($('#innerBtn')) $('#innerBtn').classList.remove('on');
+  endGlobalSearch();
+  S.sel=a.dir_rel?{type:'group',root:a.root,group:a.dir_rel}:{type:'root',root:a.root};
+  S.dup=null; if($('#dupBtn')) $('#dupBtn').classList.remove('on');
+  S.page=1; renderNav(); renderArchiveList();
+  const el=$$('#content [data-archive]').find(x=>x.dataset.archive===path);
+  if(el && el.scrollIntoView){ try{ el.scrollIntoView({block:'center',behavior:'smooth'}); }catch(e){ el.scrollIntoView(); } }
+}
+
+async function openTrashManager(){
+  const d=await fetch('/api/trash/list').then(r=>r.json()).catch(()=>({items:[],size:'0 B'}));
+  const items=d.items||[];
+  const sel=new Set();
+  const cards=items.map(it=>`<div class="trashcard" data-tr="${esc(it.path)}" title="${esc(it.name)}\n${esc(it.origin||'')}">
+    <button class="tc-x" data-restore="${esc(it.path)}" title="还原">↩</button>
+    <div class="tc-box">${it.is_dir?'📁':'📄'}</div>
+    <div class="tc-nm">${esc(it.name)}</div>
+    <div class="tc-sz">${esc(it.size)}</div>
+  </div>`).join('') || '<div style="grid-column:1/-1;color:var(--text3);font-size:12.5px;padding:16px;text-align:center">回收站是空的</div>';
+  dialog(`<h3>工具回收站 <span style="font-size:12px;color:var(--text3)">${esc(d.size||'0 B')} · ${items.length} 项</span></h3>
+    <div class="body"><div class="trashgrid" id="trashGrid">${cards}</div></div>
+    <div class="foot">
+      <button class="fbtn" id="trOpenFolder">打开文件夹</button>
+      <span style="flex:1"></span>
+      <button class="fbtn" id="trRestoreSel">还原选中</button>
+      <button class="fbtn" id="trEmpty">清空</button><button class="fbtn solid" id="trClose">关闭</button></div>`, null, 640);
+  $('#trClose').onclick=closeDialog;
+  $('#trOpenFolder').onclick=()=>post('/api/trash/open', {});
+  $('#trEmpty').onclick=async()=>{
+    if(!confirm('清空工具回收站？')) return;
+    const r=await post('/api/trash/empty',{});
+    toast(`已清空 ${r.removed||0} 个`); closeDialog(); openTrashManager();
+  };
+  const paint=()=>$$('#trashGrid [data-tr]').forEach(el=>el.classList.toggle('sel', sel.has(el.dataset.tr)));
+  $('#trashGrid').onclick=ev=>{ if(!ev.target.closest('[data-tr]')){ sel.clear(); paint(); } };
+  $$('#trashGrid [data-tr]').forEach(el=>{
+    el.onclick=ev=>{
+      if(ev.target.closest('[data-restore]')) return;
+      const p=el.dataset.tr;
+      if(ev.ctrlKey||ev.metaKey){ if(sel.has(p)) sel.delete(p); else sel.add(p); }
+      else if(ev.shiftKey){ $$('#trashGrid [data-tr]').forEach(x=>sel.add(x.dataset.tr)); }
+      else if(sel.size===1 && sel.has(p)){ sel.clear(); }   // 再点一次取消选中
+      else { sel.clear(); sel.add(p); }
+      paint();
+    };
+  });
+  const restore=async(paths)=>{
+    if(!paths.length) return toast('先选几个');
+    let ok=0; S.taskCancel=false; taskBegin('还原', paths.length);
+    for(let i=0;i<paths.length;i++){
+      if(S.taskCancel) break;
+      const r=await post('/api/trash/restore',{path:paths[i]});
+      if(!r.error){ if(r.meta) applyMeta(r.meta); ok++; }
+      taskStep(i+1,paths.length,'还原');
+    }
+    taskEnd(); toast(`已还原 ${ok} 个`); closeDialog(); openTrashManager(); renderNav();
+  };
+  $('#trRestoreSel').onclick=()=>restore([...sel]);
+  $$('#trashGrid [data-restore]').forEach(b=>{
+    b.onclick=ev=>{ ev.stopPropagation(); restore([b.dataset.restore]); };
+  });
+}
+
+async function exportBackup(){
+  const d=await fetch('/api/backup/export').then(r=>r.json()).catch(()=>null);
+  if(!d) return toast('导出失败');
+  const stamp=new Date().toISOString().slice(0,10).replace(/-/g,'');
+  downloadText('Zip2mmd_backup_' + stamp + '.json', JSON.stringify(d,null,2));
+  toast('已导出备份');
+}
+function importBackup(){
+  const inp=document.createElement('input'); inp.type='file'; inp.accept='.json,application/json';
+  inp.onchange=async()=>{
+    const f=inp.files&&inp.files[0]; if(!f) return;
+    try{
+      const data=JSON.parse(await f.text());
+      if(!confirm('导入备份会覆盖当前配置与索引，继续？')) return;
+      const d=await post('/api/backup/import',{data});
+      if(d.error) return toast(d.error);
+      toast('已导入：' + (d.imported||[]).join(', '));
+      await loadMeta(); renderNav(); renderArchiveList();
+    }catch(e){ toast('备份文件无效'); }
+  };
+  inp.click();
 }
 
 function frontView(){
@@ -5424,33 +9612,137 @@ function frontView(){
   CTL.update();
 }
 
+/* 静默读取包内文件列表：不碰 S.cur / S.files / 内容区，不跳转 */
+async function listArchiveFiles(p){
+  try{
+    const d = await fetch(`/api/list?path=${enc(p)}&password=${enc(S.pwd)}`).then(r=>r.json());
+    if(d.need_password || d.error) return null;
+    return d.files || [];
+  }catch(e){ return null; }
+}
+
+/* 临时把模型加载依赖的全局状态切到目标包，跑完再恢复——这样视口能渲染它，但列表视图不跳转 */
+async function withArchiveContext(p, files, fn){
+  const oldCur = S.cur, oldFiles = S.files, oldName = S.curName, oldTried = S.pwTried;
+  S.cur = p; S.files = files; S.curName = p.split(/[\\/]/).pop(); S.pwTried = false;
+  try{ return await fn(); }
+  finally{ S.cur = oldCur; S.files = oldFiles; S.curName = oldName; S.pwTried = oldTried; }
+}
+
+/* 贴图是异步加载的：模型 onLoad 只代表结构好了，贴图 image 可能还没解码完。
+   等场景里所有贴图都就绪再截图，否则截到白模。加载失败的贴图带超时兜底。 */
+function pendingTextures(obj){
+  let n = 0;
+  const keys = ['map','emissiveMap','normalMap','alphaMap','aoMap','bumpMap','lightMap','displacementMap'];
+  obj.traverse(o=>{
+    if(!o.material) return;
+    (Array.isArray(o.material)?o.material:[o.material]).forEach(m=>{
+      keys.forEach(k=>{ const t=m[k]; if(t && t.isTexture && !t.image) n++; });
+    });
+  });
+  return n;
+}
+async function waitTexturesReady(obj, timeout){
+  const t0 = Date.now();
+  while(pendingTextures(obj) > 0 && Date.now()-t0 < (timeout||9000)) await wait(120);
+}
+
+/* 等待目标模型真正进入视口：loadModel 是回调式加载，函数返回时模型还没 onLoad。
+   _modelInner / curModelPath 在开始加载时设置，OBJ 在加载完成后设置，三者同时满足才算就绪。 */
+function waitModelReady(inner, arc, timeout){
+  return new Promise(resolve=>{
+    const t0 = Date.now();
+    (function tick(){
+      if(_modelInner === inner && curModelPath === arc && OBJ) return resolve(true);
+      if(Date.now() - t0 > (timeout || 20000)) return resolve(false);
+      setTimeout(tick, 100);
+    })();
+  });
+}
+
+/* 加载目标模型 → 等贴图 → 正面取景 → 显式渲染 → 截图 → 存为 p 的封面。
+   全程用 withArchiveContext 临时切换全局状态，不打开包、不跳转列表视图。 */
+async function renderCoverFor(inner, p, files){
+  if(!R && !initGL()) return {ok:false, err:'视口未初始化'};
+  try{
+    return await withArchiveContext(p, files, async ()=>{
+      await loadModel(inner);
+      if(!await waitModelReady(inner, p)) return {ok:false, err:'模型加载超时'};
+      await waitTexturesReady(OBJ);        // 等贴图解码完，避免截到白模
+      frontView();
+      R.render(SC, CAM);                   // 渲染循环是按需的，换相机后必须显式画一帧
+      await wait(80);
+      R.render(SC, CAM);
+      const png = $('#c3d').toDataURL('image/png');
+      return await post('/api/cover/save', {path:p, password:S.pwd, png});
+    });
+  }catch(e){ return {ok:false, err:String(e)}; }
+}
+
+/* 封面写好后的统一刷新：清缓存 + 换 URL + 重画外层卡片和包内视图，保证两边一致 */
+function afterCoverSaved(){
+  S.coverMap = null;               // 「有/无预览图」筛选要重新扫描
+  S.coverVer++;                    // coverURL 带 v=，破坏 img 缓存
+  renderArchiveList();
+  if(S.cur) renderFiles();
+}
+
+async function genCoverForArchive(path){
+  if(!R && !initGL()) return;
+  try{
+    // 静默读包内文件，不 openArchive、不跳转列表视图
+    const files = await listArchiveFiles(path);
+    if(!files) return toast('打不开这个包（可能需要密码）');
+    const m = files.find(f=>f.is_3d);
+    if(!m) return toast('这个包里没有模型');
+    const d = await renderCoverFor(m.path, path, files);
+    if(d && d.ok){ afterCoverSaved(); toast('已生成正面预览图'); }
+    else toast((d && (d.error||d.err)) || '生成失败');
+    if(S.batch && S.batch.on) batchExit();   // 批量模式下右键生成后退出批量
+  }catch(e){ toast('生成失败：'+String(e)); }
+}
+
+async function genCoverFromModel(inner){
+  if(!R && !initGL()) return;
+  const p = S.cur;
+  if(!p) return toast('先打开这个压缩包');
+  try{
+    // 包内右键：当前视图已经是这个包，直接用它的文件列表
+    const d = await renderCoverFor(inner, p, S.files);
+    if(d && d.ok){ afterCoverSaved(); toast('已生成正面预览图'); }
+    else toast((d && (d.error||d.err)) || '生成失败');
+    if(S.batch && S.batch.on) batchExit();
+  }catch(e){ toast('生成失败：'+String(e)); }
+}
+
 async function batchCovers(paths){
   if(!R && !initGL()) return;
   let ok = 0, skip = 0, i = 0;
+  S.taskCancel = false; taskBegin('预览图', paths.length);
   for(const p of paths){
+    if(S.taskCancel) break;
     i++;
-    toast(`生成预览图 ${i}/${paths.length}…`);
+    taskStep(i, paths.length, '预览图');
     try{
-      await openArchive(p);
-      const m = (S.files||[]).find(f=>f.is_3d);
+      // 静默列文件，不 openArchive —— 列表视图保持不动
+      const files = await listArchiveFiles(p);
+      const m = files && files.find(f=>f.is_3d);
       if(!m){ skip++; continue; }
-      await loadModel(m.path);
-      await wait(1400);
-      frontView();
-      await wait(260);
-      const png = $('#c3d').toDataURL('image/png');
-      const d = await post('/api/cover/save', {path:p, password:S.pwd, png});
-      if(d.ok) ok++; else skip++;
+      const d = await renderCoverFor(m.path, p, files);
+      if(d && d.ok) ok++; else skip++;
     }catch(e){ skip++; }
   }
-  S.coverMap = null; S.coverVer++;
+  taskEnd();
+  afterCoverSaved();
   toast(`完成：生成 ${ok} 张` + (skip ? `，跳过 ${skip} 个` : ''));
-  batchExit();
+  batchExit();                             // 生成完退出批量模式
 }
 /* ===================== 启动 ===================== */
 (async function(){
   await loadMeta();
+  loadQHistory();
   S.sel = {type:'all'};
+  restoreUI();          // 回到上次的分组 / 页 / 排序
   renderNav();
   renderArchiveList();
   initGL();
@@ -5461,7 +9753,7 @@ async function batchCovers(paths){
 """
 
 
-WINDOW_TITLE = "Zip2mmd"
+'async'
 
 
 def _find_browser():
@@ -5482,14 +9774,16 @@ def _find_browser():
 def _profile_dir():
     """浏览器配置目录放到 %LOCALAPPDATA%，不要放进项目文件夹。
     项目文件夹可能被安全软件/沙箱 ACL 限制（例如禁用删除子项），
-    Edge 启动时要清理自己的缓存，被拒绝就会报权限错误，甚至提示「提升权限重启」。"""
+    Edge 启动时要清理自己的缓存，被拒绝就会报权限错误，甚至提示「提升权限重启」。
+    按端口隔离：多开时每个实例用独立 profile/浏览器进程，关一个不影响其它实例。"""
     base = os.environ.get("LOCALAPPDATA") or os.path.join(
         os.path.expanduser("~"), "AppData", "Local")
-    p = os.path.join(base, "ZipPreviewTool", "browser")
+    # 同一端口稳定复用同一个 profile；不同端口各自独立
+    p = os.path.join(base, "ZipPreviewTool", "browser-%d" % APP_PORT)
     try:
         os.makedirs(p, exist_ok=True)
     except Exception:
-        p = os.path.join(tempfile.gettempdir(), "ZipPreviewTool-browser")
+        p = os.path.join(tempfile.gettempdir(), "ZipPreviewTool-browser-%d" % APP_PORT)
         os.makedirs(p, exist_ok=True)
     return p
 
@@ -5509,18 +9803,65 @@ def _gesture_off(prof):
             with open(pf, "r", encoding="utf-8") as f:
                 data = json.load(f)
         g = data.get("edge_mouse_gesture")
-        if not isinstance(g, dict):
-            g = {}
-        if g.get("enabled") is False:
+        # 用户已在设置里明确开/关过（键存在）就尊重其选择，不再强制关
+        if isinstance(g, dict) and "enabled" in g:
             return
+        g = dict(g) if isinstance(g, dict) else {}
         g["enabled"] = False
         data["edge_mouse_gesture"] = g
-        tmp = pf + ".zt"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-        os.replace(tmp, pf)
+        with _JSON_WRITE_LOCK:
+            _atomic_json(pf, data, separators=(",", ":"))
     except Exception:
         pass
+
+
+def _gesture_state(prof):
+    """读本工具浏览器配置里鼠标手势当前是否开启。Edge 有 edge_mouse_gesture.enabled；
+    Chrome 没有这个特性，返回 supported=False。"""
+    try:
+        exe = _find_browser() or ""
+        is_edge = "msedge" in os.path.basename(exe).lower()
+        if not is_edge:
+            return {"supported": False, "on": False}
+        pf = os.path.join(prof, "Default", "Preferences")
+        data = {}
+        if os.path.isfile(pf):
+            with open(pf, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        g = data.get("edge_mouse_gesture")
+        on = bool(g.get("enabled")) if isinstance(g, dict) else False   # 缺省关闭
+        return {"supported": True, "on": on}
+    except Exception:
+        return {"supported": False, "on": False}
+
+
+def _gesture_set(prof, on):
+    """设置本工具浏览器配置的鼠标手势开关。开/关都原子写，重启窗口后生效。"""
+    try:
+        pf = os.path.join(prof, "Default", "Preferences")
+        os.makedirs(os.path.dirname(pf), exist_ok=True)
+        data = {}
+        if os.path.isfile(pf):
+            with open(pf, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        g = data.get("edge_mouse_gesture")
+        if not isinstance(g, dict):
+            g = {}
+        g["enabled"] = bool(on)
+        data["edge_mouse_gesture"] = g
+        with _JSON_WRITE_LOCK:
+            _atomic_json(pf, data, separators=(",", ":"))
+        return True
+    except Exception:
+        return False
+
+
+def _gesture_enabled(prof):
+    """用户在设置里明确开启才返回 True；缺省关闭。"""
+    try:
+        return bool(_gesture_state(prof).get("on"))
+    except Exception:
+        return False
 
 
 def _launch_app_window(url):
@@ -5530,19 +9871,21 @@ def _launch_app_window(url):
         return None
     prof = _profile_dir()
     _gesture_off(prof)
+    # 基础禁用项（和鼠标手势无关）
+    disabled = ["msEdgeIdentity", "msImplicitSignin", "msEdgeSyncPromo",
+                "EdgeIdentity", "msEdgeAccountConsistency", "EdgeCollections",
+                "msEdgeWebCapture", "EdgeSidebar", "msEdgeWorkspaces"]
+    # 鼠标手势默认关闭：只有用户在设置里打开，才不把这些特性禁掉
+    if not _gesture_enabled(prof):
+        disabled += ["msEdgeMouseGesture", "msMouseGesture", "EdgeMouseGesture",
+                     "mouse_gesture", "msEdgeGestures", "msEdgeMouseGestureSupported",
+                     "msEdgeMouseGestureDefaultEnabled"]
     args = [
         exe, f"--app={url}", "--window-size=1500,940",
         f"--user-data-dir={prof}",
         "--no-first-run", "--no-default-browser-check",
         "--no-service-autorun", "--disable-sync",
-        "--disable-features=msEdgeIdentity,msImplicitSignin,msEdgeSyncPromo,"
-        "EdgeIdentity,msEdgeAccountConsistency,EdgeCollections,"
-        "msEdgeWebCapture,EdgeSidebar,msEdgeWorkspaces,"
-        # 右键拖动会被 Edge 的「鼠标手势」抢走（弹前进/后退/滚动那种提示），
-        # 这几个是它可能使用的特性名，写全了总有一个生效
-        "msEdgeMouseGesture,msMouseGesture,EdgeMouseGesture,"
-        "mouse_gesture,msEdgeGestures,msEdgeMouseGestureSupported,"
-        "msEdgeMouseGestureDefaultEnabled",
+        "--disable-features=" + ",".join(disabled),
         "--disable-background-networking",
         "--hide-crash-restore-bubble",
         # 关掉 Edge 的「后台继续运行」，否则最后一个窗口关掉后 Edge 进程还赖着，
@@ -5564,6 +9907,12 @@ def _console_hwnd():
         return ctypes.windll.kernel32.GetConsoleWindow() or None
     except Exception:
         return None
+
+
+# 窗口标题带版本号 + 端口：每个实例唯一，_find_app_hwnd 只认自己的窗口。
+# 页面 <title> 也是 "Zip2mmd v<版本> :<端口>"，两者必须一致才能找到窗口。
+def _window_title():
+    return "Zip2mmd v%s :%d" % (APP_VERSION, APP_PORT)
 
 
 def _find_app_hwnd(title, exclude=None):
@@ -5654,6 +10003,7 @@ if __name__ == "__main__":
         cleanup_cache()
         prune_extract_cache()
     load_enc_cache()
+    load_sfx_cache()
     cfg = load_config()
     # 外部工具路径从配置里取（代码里不再写死作者机器的路径，方便打包分发）
     for _key, _var in (("seven_zip", "SEVEN_ZIP"), ("unrar", "UNRAR"), ("pmx_editor", "PMX_EDITOR")):
@@ -5663,6 +10013,10 @@ if __name__ == "__main__":
     if not SEVEN_ZIP:
         print("  [!] 没找到 7z.exe：压缩包功能不可用。装 7-Zip，或在 config.json 里写 \"seven_zip\"。")
     threading.Thread(target=prewarm_encryption, args=(cfg["watch_dirs"],), daemon=True).start()
+    # 封面索引放后台慢慢补，首屏不阻塞；界面查询时若还在预热会拿到部分结果并自动轮询
+    _cover_timer = threading.Timer(3.0, warm_cover_index)
+    _cover_timer.daemon = True
+    _cover_timer.start()
     PORT = 5678
     for i, a in enumerate(sys.argv):
         if a == "--port" and i + 1 < len(sys.argv):
@@ -5670,8 +10024,42 @@ if __name__ == "__main__":
         elif a.startswith("--port="):
             PORT = int(a.split("=", 1)[1])
     url = f"http://127.0.0.1:{PORT}/"
+
+    from werkzeug.serving import make_server
+    srv = None
+
+    def _port_busy(p):
+        """探测端口是否已有服务在监听。
+        不能只靠 make_server 抛异常：Windows 下 SO_REUSEADDR 允许两个进程绑同一端口，
+        make_server 不报错，结果两个实例都占 5678、请求被随机分发。
+        用 connect_ex 探测「有没有人在监听」更可靠。"""
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.25)
+        try:
+            return s.connect_ex(("127.0.0.1", p)) == 0
+        finally:
+            s.close()
+
+    # 端口被旧实例占着时自动往后找，避免「新版本起不来 / 浏览器连到旧页面」
+    for _p in range(PORT, PORT + 10):
+        if _port_busy(_p):
+            continue
+        try:
+            srv = make_server("127.0.0.1", _p, app, threaded=True)
+        except OSError:
+            srv = None
+            continue
+        if _p != PORT:
+            print(f"  端口 {PORT} 被占用（可能还有旧实例在跑），改用 {_p}")
+        PORT = _p
+        url = f"http://127.0.0.1:{PORT}/"
+        break
+
+    # 端口确定后再写入全局：页面 <title>、窗口标题、浏览器 profile 都依赖它做实例隔离
+    APP_PORT = PORT
+
     print("=" * 62)
-    print("  Zip2mmd v1.0  ·  压缩包预览工具")
+    print(f"  Zip2mmd v{APP_VERSION}  ·  压缩包预览工具")
     print("=" * 62)
     print(f"  7z       : {SEVEN_ZIP}")
     print(f"  PMXEditor: {PMX_EDITOR}")
@@ -5683,15 +10071,10 @@ if __name__ == "__main__":
     print("  关掉应用窗口 = 程序退出（想用普通浏览器加参数 --browser）")
     print("=" * 62)
 
-    from werkzeug.serving import make_server
-    try:
-        srv = make_server("127.0.0.1", PORT, app, threaded=True)
-    except OSError:
-        # 端口已被占用：多半是工具已经在跑。别再报一串红字，直接把浏览器指过去。
-        print(f"  端口 {PORT} 已被占用（工具应该已经在运行），直接打开浏览器。")
-        import webbrowser
-        webbrowser.open(url)
-        sys.exit(0)
+    if srv is None:
+        print(f"  端口 {PORT}~{PORT+9} 全被占用，无法启动。")
+        sys.exit(1)
+
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
 
@@ -5705,8 +10088,8 @@ if __name__ == "__main__":
             srv.shutdown()
         except Exception:
             pass
+        # 是否真的清理由 _wipe_now 决定：多开时只让最后一个退出的实例清共享缓存
         if wipe_on_exit:
-            print("  正在清空缓存…")
             _wipe_now()
         time.sleep(0.2)
         os._exit(0)
@@ -5724,39 +10107,26 @@ if __name__ == "__main__":
             proc = _launch_app_window(url)
             if proc is not None:
                 t0 = time.time()
-                # 只等 6 秒：等太久什么都没发生，看起来就是「双击没反应」。
-                while time.time() - t0 < 6:
-                    hwnd = _find_app_hwnd(WINDOW_TITLE)
+                # 最多等 10 秒。注意：不能因为「启动的浏览器进程退了」就放弃等待，
+                # Edge 可能把窗口交给已有实例后自己立刻退出，窗口稍后才出现。
+                while time.time() - t0 < 10:
+                    hwnd = _find_app_hwnd(_window_title())
                     if hwnd:
                         break
-                    time.sleep(0.4)
+                    time.sleep(0.25)
 
             if hwnd:
-                # 正常路径：关窗口 = 进程退出 = 端口释放
+                # 唯一判据是「窗口还在不在」：
+                # 不用浏览器进程判断——Edge 可能把新窗口交给已有实例后自己退出，
+                # 也可能关掉窗口后仍留在后台，用进程判断会误杀/误留。
                 print("  应用窗口已打开。关闭窗口即结束程序（端口随即释放）。")
                 while _window_alive(hwnd) and not _QUIT.is_set():
                     time.sleep(0.6)
                 print("  窗口已关闭，正在退出…")
-            elif proc is not None and proc.poll() is None:
-                # 窗口没抓到，但 Edge 进程还在跑：盯着它，窗口关掉进程就退出
-                print(f"  没抓到窗口句柄，改为跟踪浏览器进程。若看不到界面，请手动打开 {url}")
-                while proc.poll() is None and not _QUIT.is_set():
-                    # 中途抓到窗口就以窗口为准（更准：Edge 后台常驻也不影响）
-                    h = _find_app_hwnd(WINDOW_TITLE)
-                    if h:
-                        while _window_alive(h) and not _QUIT.is_set():
-                            time.sleep(0.6)
-                        break
-                    time.sleep(0.6)
-                print("  窗口已关闭，正在退出…")
             else:
-                # 连窗口都没起来：退到默认浏览器，进程跟随这个黑框
-                print(f"  未能启动应用窗口，改用默认浏览器：{url}")
-                print("  （关掉这个黑框 = 结束程序，端口随即释放）")
-                import webbrowser
-                webbrowser.open(url)
-                while t.is_alive() and not _QUIT.is_set():
-                    t.join(1)
+                # 10 秒内没抓到窗口：直接退出，不在后台挂着；也不去动浏览器进程
+                print("  没能找到应用窗口，直接退出（避免留下后台进程）。")
+                print(f"  需要的话可以手动打开：{url}")
     except KeyboardInterrupt:
         print("\n  已中断")
 
