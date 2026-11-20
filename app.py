@@ -9775,11 +9775,12 @@ def _profile_dir():
     """浏览器配置目录放到 %LOCALAPPDATA%，不要放进项目文件夹。
     项目文件夹可能被安全软件/沙箱 ACL 限制（例如禁用删除子项），
     Edge 启动时要清理自己的缓存，被拒绝就会报权限错误，甚至提示「提升权限重启」。
-    按端口隔离：多开时每个实例用独立 profile/浏览器进程，关一个不影响其它实例。"""
+    按 exe 所在目录 + 端口隔离：不同目录的 exe 是不同用户/不同安装，各自一份 localStorage；
+    同目录多开则靠端口继续隔离，关一个不影响其它实例。"""
     base = os.environ.get("LOCALAPPDATA") or os.path.join(
         os.path.expanduser("~"), "AppData", "Local")
-    # 同一端口稳定复用同一个 profile；不同端口各自独立
-    p = os.path.join(base, "ZipPreviewTool", "browser-%d" % APP_PORT)
+    ident = hashlib.sha1(BASE_DIR.replace('\\', '/').encode('utf-8', 'surrogatepass')).hexdigest()[:8]
+    p = os.path.join(base, "ZipPreviewTool", "browser-%d-%s" % (APP_PORT, ident))
     try:
         os.makedirs(p, exist_ok=True)
     except Exception:
@@ -9944,7 +9945,9 @@ def _find_app_hwnd(title, exclude=None):
         buf = ctypes.create_unicode_buffer(n + 1)
         u.GetWindowTextW(h, buf, n + 1)
         t = buf.value.strip()
-        if t == title or t.startswith(title + ' ') or t.startswith(title + ' - '):
+        port = ':' + title.rsplit(':', 1)[-1] if ':' in title else ''
+        if (t == title or t.startswith(title + ' ') or t.startswith(title + ' - ')
+            or (port and 'Zip2mmd' in t and port in t)):
             found.append(h)
         return True
 
