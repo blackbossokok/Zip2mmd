@@ -738,13 +738,36 @@ def tree_list(node, prefix=""):
     return out
 
 
+def scan_dir_tree(watch_dirs):
+    """扫描每个监控根下的真实目录（含空目录），返回 {root: [相对路径, ...]}。
+    左侧目录树用它建骨架，这样空文件夹不会因为没有压缩包而消失；跳过 _cache。"""
+    result = {}
+    for root in watch_dirs:
+        rels = []
+        if os.path.isdir(root):
+            base = os.path.abspath(root)
+            for cur, dirs, _files in os.walk(root):
+                dirs[:] = sorted([d for d in dirs if not d.startswith("_cache")], key=str.lower)
+                for d in dirs:
+                    rels.append(os.path.relpath(os.path.join(cur, d), base).replace("\\", "/"))
+        result[root] = rels
+    return result
+
+
 def meta_summary(arch, watch_dirs):
-    """从 archives 列表算出前端要的 roots/tree/totals。全量与增量共用。"""
+    """从 archives 列表算出前端要的 roots/tree/totals。全量与增量共用。
+    目录树先按真实文件夹建骨架（空文件夹也保留），再把压缩包计数叠加到每一级。"""
+    real_dirs = scan_dir_tree(watch_dirs)
     roots = []
     for root in watch_dirs:
         items = [a for a in arch if a["root"] == root]
-        # 目录树：按 rel 的每一级建节点，子文件夹才能在左侧逐级展开
         tree = {"children": {}, "count": 0}
+        # 骨架：真实目录全部建节点，count 由下面的 archive 叠加决定（空目录保持 0）
+        for rel in real_dirs.get(root, ()):
+            node = tree
+            for part in [p for p in rel.split("/") if p]:
+                node = node["children"].setdefault(part, {"children": {}, "count": 0})
+        # 计数：按 rel 的每一级累加，子文件夹才能在左侧逐级展开
         for a in items:
             rel = a.get("rel") or ""
             node = tree
@@ -1846,6 +1869,87 @@ def api_cover_save():
                     pass
     with _list_lock:
         _list_cache.clear()
+    return jsonify({"ok": True, "inner": COVER_FOLDER + "/" + name})
+
+
+@app.route("/api/cover/set-from-inner", methods=["POST"])
+def api_cover_set_from_inner():
+    """把包内已有的一张图片指定为预览图：
+    复制一份字节写入 ZipPreview/<默认封面名>，源文件保持不动。只支持 zip / 7z。"""
+    body = request.get_json(silent=True) or {}
+    p = body.get("path", "")
+    source = body.get("inner", "")          # 包内源图片路径
+    pw = body.get("password", "") or load_config().get("password", DEFAULT_PASSWORD)
+    if not os.path.isfile(p) or not is_under_roots(p):
+        return jsonify({"error": "压缩包路径无效"}), 400
+    if not source:
+        return jsonify({"error": "未指定包内图片"}), 400
+    ext = os.path.splitext(p)[1].lower()
+    if ext not in (".zip", ".7z"):
+        return jsonify({"error": "rar / 自解压包不支持写入封面，请改用 zip 或 7z"}), 400
+    # 确认源图片确实在包内，并读出字节（read_bytes 走缓存，不改动源文件）
+    try:
+        if source not in archive_paths(p, pw):
+            return jsonify({"error": "包内找不到这张图片"}), 404
+        raw = read_bytes(p, source, pw)
+        if not raw:
+            return jsonify({"error": "读取源图片失败"}), 400
+    except Exception as e:
+        return jsonify({"error": "读取源图片失败：" + str(e)[:120]}), 500
+
+    names = cover_names()
+    name = os.path.basename(names[0]) or "ZipPreview.png"
+    try:
+        tmpdir = tempfile.mkdtemp(dir=TMP_DIR)
+        folder = os.path.join(tmpdir, COVER_FOLDER)
+        os.makedirs(folder, exist_ok=True)
+        target = os.path.join(folder, name)
+        ne = os.path.splitext(name)[1].lower()
+        se = os.path.splitext(source)[1].lower()
+        # 目标名是 jpg/webp 时转格式；源是 tga/dds 等浏览器不认的格式也转成像素再按目标名写
+        if ne in (".jpg", ".jpeg", ".webp") or se in (".tga", ".dds", ".bmp", ".spa", ".sph", ".toon"):
+            from PIL import Image
+            if se in (".tga", ".dds") or ne in (".jpg", ".jpeg", ".webp"):
+                im = Image.open(io.BytesIO(raw))
+                im.load()
+                if ne in (".jpg", ".jpeg", ".webp"):
+                    im = im.convert("RGB")
+                    im.save(target, "JPEG" if ne != ".webp" else "WEBP", quality=92)
+                else:
+                    if im.mode not in ("RGB", "RGBA"):
+                        im = im.convert("RGBA")
+                    im.save(target, "PNG")
+            else:
+                with open(target, "wb") as f:
+                    f.write(raw)
+        else:
+            with open(target, "wb") as f:
+                f.write(raw)
+        base = [SEVEN_ZIP, "a", "-y", "-bso0", "-bse0"]
+        rel = os.path.join(COVER_FOLDER, name)
+        r = _run(base + [p, rel], timeout=120, cwd=tmpdir)
+        if r.returncode != 0 and pw:
+            r = _run(base + ["-p" + pw, p, rel], timeout=120, cwd=tmpdir)
+        if r.returncode != 0:
+            return jsonify({"error": "写入失败：" + (r.stderr.decode("utf-8", "replace").strip()[:160] or str(r.returncode))}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+    with _cover_lock:
+        _cover_index.clear()
+        for f in os.listdir(COVER_DIR):
+            if f.endswith(".png"):
+                try:
+                    os.remove(os.path.join(COVER_DIR, f))
+                except OSError:
+                    pass
+    with _list_lock:
+        _list_cache.clear()
+    _cover_flag.clear()
     return jsonify({"ok": True, "inner": COVER_FOLDER + "/" + name})
 
 
@@ -4287,6 +4391,43 @@ function navFoldParent(rootPath, group){
     catch(e){ try{ row.scrollIntoView(); }catch(e2){} }
   }
 }
+/* 定位并选中一个真实目录（绝对路径）：移动 / 复制 / 拖拽完成后调用，
+   让左侧目录树自动展开到目标文件夹并选中它，列表跟着显示该文件夹内容。 */
+function navSelectDir(dirPath){
+  if(!dirPath || !S.meta || !S.meta.roots) return false;
+  const ns = p => String(p||'').replace(/\\/g,'/').replace(/\/+$/,'');
+  const norm = ns(dirPath);
+  let root = null, group = '';
+  // 最长 root 匹配（嵌套监控目录取更具体的那个）
+  for(const r of S.meta.roots){
+    const rp = ns(r.path);
+    if(norm === rp || norm.startsWith(rp + '/')){
+      if(!root || rp.length > ns(root).length){ root = r.path; group = norm.slice(rp.length).replace(/^\//,''); }
+    }
+  }
+  if(!root) return false;
+  // 展开从 root 到目标目录的每一级，保证目标行是可见的
+  S.folded['r:' + root] = false;
+  const parts = group.split('/').filter(Boolean);
+  let acc = '';
+  for(const part of parts){
+    acc = acc ? acc + '/' + part : part;
+    S.folded['g:' + root + ':' + acc] = false;
+  }
+  saveFolded();
+  S.sel = group ? {type:'group', root, group} : {type:'root', root};
+  S.cur = null; S.files = []; S.page = 1;
+  saveUI();
+  renderNav();
+  renderArchiveList();
+  const key = group ? ('g:' + root + ':' + group) : ('r:' + root);
+  const row = $$('#nav [data-fold]').find(el=>el.dataset.fold === key);
+  if(row && row.scrollIntoView){
+    try{ row.scrollIntoView({block:'center', behavior:'smooth'}); }
+    catch(e){ try{ row.scrollIntoView(); }catch(e2){} }
+  }
+  return true;
+}
 
 function askMkdirSub(parent){
   dialog(`<h3>新建子文件夹</h3><div class="body">
@@ -4477,15 +4618,15 @@ async function moveTo(src, dstDir){
     askOverwrite(d.name, yes=>{
       if(!yes) return;
       post('/api/fs/move', {src, dst_dir: dstDir, overwrite: true}).then(r=>{
-        if(r.error) toast(r.error); else afterMove(r, src);
+        if(r.error) toast(r.error); else afterMove(r, src, dstDir);
       });
     });
     return;
   }
-  afterMove(d, src);
+  afterMove(d, src, dstDir);
 }
 /* 移动成功后统一记撤销 + 收藏跟随；所有移动出口都走这里 */
-function afterMove(d, src){
+function afterMove(d, src, dstDir){
   if(!d || !d.path) return;
   if(d.meta){ S.meta = d.meta; S.archives = d.meta.archives; }
   if(src){
@@ -4496,8 +4637,9 @@ function afterMove(d, src){
     }
   }
   if(S.cur && !S.archives.some(a=>a.path === S.cur)){ S.cur = null; S.files = []; }
-  S.sel = {type:'all'};
-  renderNav(); renderStat(); renderArchiveList();
+  renderStat();
+  // 定位并选中目标文件夹；定位失败才退回「全部」
+  if(!navSelectDir(dstDir)){ S.sel = {type:'all'}; renderNav(); renderArchiveList(); }
   toast('已移动');
 }
 
@@ -4897,7 +5039,8 @@ function batchCopyTo(dstDir){
     }
     taskEnd();
     if(ok) toast('已复制 '+ok+' 项');
-    batchExit(); renderNav(); renderStat(); renderArchiveList();
+    batchExit(); renderStat();
+    if(!navSelectDir(dstDir)){ renderNav(); renderArchiveList(); }
   })();
 }
 
@@ -4910,13 +5053,14 @@ async function copyTo(src, dstDir){
       if(!yes) return;
       const r = await post('/api/fs/copy', {src, dst_dir: dstDir, overwrite: true});
       if(r.error) toast(r.error);
-      else { copyRecord(r); toast('已复制（覆盖）'); renderNav(); renderStat(); renderArchiveList(); }
+      else { copyRecord(r); toast('已复制（覆盖）'); renderStat(); if(!navSelectDir(dstDir)){ renderNav(); renderArchiveList(); } }
     });
     return;
   }
   copyRecord(d);
   toast('已复制到 ' + dstDir.split(/[\\/]/).pop());
-  renderNav(); renderStat(); renderArchiveList();
+  renderStat();
+  if(!navSelectDir(dstDir)){ renderNav(); renderArchiveList(); }
 }
 /* ---------- 统一撤销栈：move / rename / trash / copy ---------- */
 const UNDO_LABEL = {move:'移动', rename:'重命名', trash:'删除', copy:'复制'};
@@ -5301,7 +5445,8 @@ async function toggleFav(path){
   try{ await post('/api/favs', {favs: [...S.favs]}); }catch(e){}
 }
 function fileCard(f){
-  const base = `path=${enc(S.cur)}&inner=${enc(f.path)}&password=${enc(S.pwd)}`;
+  // v= 跟封面版本号联动：设为预览图 / 截图写封面后，包内缩略图也强制重载，不会显示旧图
+  const base = `path=${enc(S.cur)}&inner=${enc(f.path)}&password=${enc(S.pwd)}&v=${S.coverVer||0}`;
   let box;
   if(f.is_image && f.ext!=='.dds'){
     box = `<div class="box"><img loading="lazy" src="/api/thumb?${base}"
@@ -7071,7 +7216,7 @@ function renderViewFoot(f, stats){
   if(sibs.length){
     h += `<div class="vlabel">同目录贴图（${sibs.length}）</div><div class="tgrid">`;
     h += sibs.slice(0,48).map(s=>{
-      const b = `path=${enc(S.cur)}&inner=${enc(s.path)}&password=${enc(S.pwd)}`;
+      const b = `path=${enc(S.cur)}&inner=${enc(s.path)}&password=${enc(S.pwd)}&v=${S.coverVer||0}`;
       return `<div class="t" data-lb="${esc(s.path)}"><img loading="lazy" src="/api/thumb?${b}"
         onerror="this.style.visibility='hidden'"></div>`;
     }).join('');
@@ -7839,6 +7984,10 @@ function fileMenu(ev, inner){
   if(f && f.is_3d){
     items.push({icon:'', label:'在视口预览', run:()=>loadModel(inner)});
     items.push({icon:'', label:'生成预览图', run:()=>genCoverFromModel(inner)});
+  }
+  // 包内图片：复制一份到 ZipPreview/ 作为预览图，源文件不动
+  if(f && f.is_image){
+    items.push({icon:'', label:'设为预览图', run:()=>setInnerAsCover(inner)});
   }
   if(f && f.is_pmx && !(S.openers && S.openers['.pmx']))
     items.push({icon:'', label:'用 PMXEditor 打开', run:()=>openEditor(inner)});
@@ -8766,7 +8915,7 @@ if($('#shotOk')) $('#shotOk').onclick = async ()=>{
     try{
       const d = await post('/api/cover/save', {path:S.cur, password:S.pwd, png});
       if(d.ok){
-        afterCoverSaved();
+        await afterCoverSaved(S.cur);
         toast(`封面已保存到包内 ${S.coverFolder}/ 文件夹`);
         return;
       }
@@ -9261,7 +9410,8 @@ async function doBatchMove(paths, dst){
   if(ok && !gotMeta) await loadMeta();
   S.coverMap = null;
   toast(`移动完成：${ok} 个` + (skip ? `，跳过 ${skip} 个` : ''));
-  batchExit(); renderNav(); renderStat(); renderArchiveList();
+  batchExit(); renderStat();
+  if(!navSelectDir(dst)){ renderNav(); renderArchiveList(); }
 }
 
 async function batchDelCovers(paths){
@@ -9680,11 +9830,31 @@ async function renderCoverFor(inner, p, files){
 }
 
 /* 封面写好后的统一刷新：清缓存 + 换 URL + 重画外层卡片和包内视图，保证两边一致 */
-function afterCoverSaved(){
+/* 封面写好后的统一刷新：清缓存 + 换版本号 + 必要时重读包内列表 + 重画外层和包内。
+   coverPath = 这次写入封面的包路径。S.files 是打开包时的快照，新写入的 ZipPreview.png
+   不在里面；只有写入的正是当前打开的包时才静默重读，包内卡片才会同步出现新预览图。 */
+async function afterCoverSaved(coverPath){
   S.coverMap = null;               // 「有/无预览图」筛选要重新扫描
-  S.coverVer++;                    // coverURL 带 v=，破坏 img 缓存
+  S.coverVer++;                    // coverURL / thumbURL 都带 v=，破坏 img 缓存
+  const touched = coverPath && (Array.isArray(coverPath) ? coverPath : [coverPath]);
+  const shouldReload = S.cur && (!touched || touched.includes(S.cur));
+  if(shouldReload){
+    const cur = S.cur;
+    const files = await listArchiveFiles(cur);
+    if(S.cur === cur && files) S.files = files;
+  }
   renderArchiveList();
   if(S.cur) renderFiles();
+}
+
+/* 把包内某个图片设为预览图：后端复制一份到 ZipPreview/ 并改名，源文件不动 */
+async function setInnerAsCover(inner){
+  if(!S.cur) return toast('先打开一个压缩包');
+  const p = S.cur;
+  const d = await post('/api/cover/set-from-inner', {path:p, inner, password:S.pwd});
+  if(d.error) return toast(d.error);
+  await afterCoverSaved(p);
+  toast('已设为预览图（原文件保留）');
 }
 
 async function genCoverForArchive(path){
@@ -9696,7 +9866,7 @@ async function genCoverForArchive(path){
     const m = files.find(f=>f.is_3d);
     if(!m) return toast('这个包里没有模型');
     const d = await renderCoverFor(m.path, path, files);
-    if(d && d.ok){ afterCoverSaved(); toast('已生成正面预览图'); }
+    if(d && d.ok){ await afterCoverSaved(path); toast('已生成正面预览图'); }
     else toast((d && (d.error||d.err)) || '生成失败');
     if(S.batch && S.batch.on) batchExit();   // 批量模式下右键生成后退出批量
   }catch(e){ toast('生成失败：'+String(e)); }
@@ -9709,7 +9879,7 @@ async function genCoverFromModel(inner){
   try{
     // 包内右键：当前视图已经是这个包，直接用它的文件列表
     const d = await renderCoverFor(inner, p, S.files);
-    if(d && d.ok){ afterCoverSaved(); toast('已生成正面预览图'); }
+    if(d && d.ok){ await afterCoverSaved(p); toast('已生成正面预览图'); }
     else toast((d && (d.error||d.err)) || '生成失败');
     if(S.batch && S.batch.on) batchExit();
   }catch(e){ toast('生成失败：'+String(e)); }
@@ -9733,7 +9903,7 @@ async function batchCovers(paths){
     }catch(e){ skip++; }
   }
   taskEnd();
-  afterCoverSaved();
+  await afterCoverSaved(paths);
   toast(`完成：生成 ${ok} 张` + (skip ? `，跳过 ${skip} 个` : ''));
   batchExit();                             // 生成完退出批量模式
 }
